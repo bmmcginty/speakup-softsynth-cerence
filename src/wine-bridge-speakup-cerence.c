@@ -564,8 +564,32 @@ static int cmd_list_languages(void)
 
 static int cmd_list_voices(const char *language)
 {
-    uint16_t n = 0, i, j, k;
+    uint16_t n = 0, i, j, k, language_count = 0;
+    VE_LANGUAGE *languages;
     VE_VOICEINFO *voices;
+    char resolved_language[VE_MAX_STRING_LENGTH];
+
+    resolved_language[0] = '\0';
+    CHECK(ve_getLanguages(g_speech, NULL, &language_count), "getLanguages(count)");
+    languages = calloc(language_count ? language_count : 1, sizeof(VE_LANGUAGE));
+    if (!languages)
+        return -1;
+    CHECK(ve_getLanguages(g_speech, languages, &language_count), "getLanguages(list)");
+    for (i = 0; i < language_count; i++) {
+        if (!_stricmp(language, languages[i].szLanguageTLW) ||
+            !_stricmp(language, languages[i].szLanguage)) {
+            snprintf(resolved_language, sizeof resolved_language, "%s",
+                     languages[i].szLanguage);
+            break;
+        }
+    }
+    free(languages);
+    if (!resolved_language[0]) {
+        fprintf(stderr, "language is not installed: %s\n", language);
+        return -1;
+    }
+
+    language = resolved_language;
     CHECK(ve_getVoices(g_speech, language, NULL, &n), "getVoices(count)");
     voices = calloc(n ? n : 1, sizeof(VE_VOICEINFO));
     if (!voices)
@@ -857,7 +881,7 @@ static void usage(void)
         "options:\n"
         "  --lib-dir DIR               Cerence DLLs (default ../lib beside bin)\n"
         "  --data-dir DIR              common data (default ../lib/data beside bin)\n"
-        "  --store DIR                 voices (default LOCALAPPDATA\\speakup-cerence\\voices)\n"
+        "  --store DIR                 voices (default XDG data directory)\n"
         "  --voice NAME                voice name, default Tian-Tian\n"
         "  --vop OP                    operating point, default embedded-pro\n"
         "  --language LANG             force the engine language, e.g. Chinese Mandarin\n"
@@ -884,7 +908,7 @@ int wmain(int argc, wchar_t **wargv)
     wchar_t *data_dir = NULL;
     wchar_t *store = NULL;
     wchar_t root[4096], default_lib[4096], default_data[4096], default_store[4096];
-    char libdir_display[4096];
+    char default_store_unix[4096], libdir_display[4096];
     const wchar_t *dirs[3];
     size_t ndirs = 0;
     char *text_arg = NULL, *cmd_arg = NULL;
@@ -975,17 +999,44 @@ int wmain(int argc, wchar_t **wargv)
     _snwprintf(default_lib, 4095, L"%ls\\lib", root);
     _snwprintf(default_data, 4095, L"%ls\\lib\\data", root);
     {
+        const char *configured = getenv("SPEAKUP_CERENCE_VOICE_STORE");
+        const char *data_home = getenv("WINE_HOST_XDG_DATA_HOME");
+        const char *home = getenv("WINE_HOST_HOME");
         const wchar_t *local_app_data = _wgetenv(L"LOCALAPPDATA");
-        if (local_app_data && *local_app_data)
-            _snwprintf(default_store, 4095, L"%ls\\speakup-cerence\\voices", local_app_data);
-        else
+
+        if (!data_home || !*data_home)
+            data_home = getenv("XDG_DATA_HOME");
+        if (!home || !*home)
+            home = getenv("HOME");
+
+        if (configured && *configured) {
+            snprintf(default_store_unix, sizeof default_store_unix, "%s", configured);
+            store = path_to_wine(utf8_to_utf16(default_store_unix));
+        } else if (data_home && *data_home) {
+            snprintf(default_store_unix, sizeof default_store_unix,
+                     "%s/speakup-cerence/voices", data_home);
+            store = path_to_wine(utf8_to_utf16(default_store_unix));
+        } else if (home && *home) {
+            snprintf(default_store_unix, sizeof default_store_unix,
+                     "%s/.local/share/speakup-cerence/voices", home);
+            store = path_to_wine(utf8_to_utf16(default_store_unix));
+        } else if (local_app_data && *local_app_data) {
+            _snwprintf(default_store, 4095,
+                       L"%ls\\speakup-cerence\\voices", local_app_data);
+            store = _wcsdup(default_store);
+        } else {
             _snwprintf(default_store, 4095, L"%ls\\voices", root);
+            store = _wcsdup(default_store);
+        }
     }
 
     libdir = lib_dir_arg ? path_to_wine(utf8_to_utf16(lib_dir_arg)) : _wcsdup(default_lib);
     lowlevel = libdir;
     data_dir = data_dir_arg ? path_to_wine(utf8_to_utf16(data_dir_arg)) : _wcsdup(default_data);
-    store = voices_dir ? path_to_wine(utf8_to_utf16(voices_dir)) : _wcsdup(default_store);
+    if (voices_dir) {
+        free(store);
+        store = path_to_wine(utf8_to_utf16(voices_dir));
+    }
     if (lib_dir_arg) {
         _snprintf(libdir_display, sizeof libdir_display, "%s", lib_dir_arg);
     } else {
