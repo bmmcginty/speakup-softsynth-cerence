@@ -517,6 +517,28 @@ static int license_activate(const char *key, const char *license_file, const wch
 static VE_INSTALL g_install;
 static VPLATFORM_RESOURCES g_platform;
 static VE_HSAFE g_speech;
+static HANDLE g_engine_mutex;
+
+static int lock_engine(void)
+{
+    DWORD wait;
+
+    g_engine_mutex = CreateMutexW(NULL, FALSE,
+                                  L"Local\\speakup-cerence-engine-64");
+    if (!g_engine_mutex) {
+        fprintf(stderr, "cannot create the Cerence engine lock\n");
+        return -1;
+    }
+    wait = WaitForSingleObject(g_engine_mutex, 0);
+    if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED) {
+        fprintf(stderr, "the Cerence engine is already in use by another "
+                "speakup-cerence process\n");
+        CloseHandle(g_engine_mutex);
+        g_engine_mutex = NULL;
+        return -1;
+    }
+    return 0;
+}
 
 static int engine_open_data(const wchar_t **dirs, size_t ndirs)
 {
@@ -543,6 +565,11 @@ static int engine_close(void)
     }
     if (g_install.hHeap || g_install.hLog)
         ve_releaseInterfaces(&g_install);
+    if (g_engine_mutex) {
+        ReleaseMutex(g_engine_mutex);
+        CloseHandle(g_engine_mutex);
+        g_engine_mutex = NULL;
+    }
     return 0;
 }
 
@@ -1078,6 +1105,8 @@ int wmain(int argc, wchar_t **wargv)
     if (store)
         dirs[ndirs++] = store;
 
+    if (lock_engine() < 0)
+        return 1;
     if (engine_open_data(dirs, ndirs) < 0)
         return 1;
 

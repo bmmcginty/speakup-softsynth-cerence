@@ -79,6 +79,12 @@ With no filters it selects the best installed voice. Speakup's flush, index,
 rate, pitch, volume, and pause commands are handled directly. Indexes are
 written back when PipeWire reaches their audio position.
 
+The Cerence engine cannot be opened safely by two Wine bridge processes at
+once. A second bridge now exits immediately with an "engine is already in use"
+error instead of hanging during initialization. Use
+`speakup-cerence-voice-manager --list-voices` to inspect the downloadable
+catalogue while the speech runtime is active.
+
 The engine licence belongs to the Wine prefix. Existing Cerence activation can
 be selected with `WINEPREFIX`; the bridge reports a licensing error if the
 engine cannot open a voice.
