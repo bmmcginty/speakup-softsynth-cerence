@@ -75,9 +75,16 @@ reader. The user running this program needs read/write access to
 bin/speakup-cerence --lang MNC --quality enhanced
 ```
 
-With no filters it selects the best installed voice. Speakup's flush, index,
-rate, pitch, volume, and pause commands are handled directly. Indexes are
-written back when PipeWire reaches their audio position.
+Installed voices matching the filters are ordered alphabetically by name, with
+the best installed quality retained when a name has several qualities. Voice 1
+is active at startup. Speakup values 1 through 6 select voices on the current
+six-voice page, 7 advances to the next page, and 0 returns to the previous
+page. Selection is clamped at both ends: 0 returns to the startup voice on the
+first page, and unavailable positions on the final page select the last voice.
+This uses Speakup's existing 0–7 voice-control range without a kernel change.
+
+Speakup's flush, index, rate, pitch, volume, and pause commands are also handled
+directly. Indexes are written back when PipeWire reaches their audio position.
 
 The Cerence engine cannot be opened safely by two Wine bridge processes at
 once. A second bridge now exits immediately with an "engine is already in use"

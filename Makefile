@@ -8,8 +8,8 @@ PIPEWIRE_LIBS := $(shell pkg-config --libs libpipewire-0.3)
 .PHONY: all clean test
 all: bin/speakup-cerence bin/speakup-cerence-voice-manager bin/wine-bridge-speakup-cerence.exe
 
-bin/speakup-cerence: src/speakup-cerence.c | bin
-	$(CC) $(CFLAGS) $(WARN) $(PIPEWIRE_CFLAGS) -o $@ $< $(PIPEWIRE_LIBS) -lpthread
+bin/speakup-cerence: src/speakup-cerence.c src/voice-list.c src/voice-list.h | bin
+	$(CC) $(CFLAGS) $(WARN) $(PIPEWIRE_CFLAGS) -Isrc -o $@ src/speakup-cerence.c src/voice-list.c $(PIPEWIRE_LIBS) -lpthread
 
 bin/speakup-cerence-voice-manager: src/speakup-cerence-voice-manager.py | bin
 	cp $< $@
@@ -25,4 +25,7 @@ clean:
 	rm -f bin/speakup-cerence bin/speakup-cerence-voice-manager bin/wine-bridge-speakup-cerence.exe
 
 test: all
+	$(CC) $(CFLAGS) $(WARN) -Isrc -o /tmp/speakup-cerence-voice-list-test tests/voice-list.c src/voice-list.c
+	/tmp/speakup-cerence-voice-list-test
+	rm -f /tmp/speakup-cerence-voice-list-test
 	./tests/cli.sh

@@ -18,6 +18,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "voice-list.h"
+
 #define RATE 22050
 #define AUDIO_CAP (RATE * 2 * 30)
 #define FRAME_AUDIO 'A'
@@ -35,6 +37,8 @@
 static volatile sig_atomic_t stopping;
 static int synth_fd = -1;
 static char installation_root[4096];
+static struct voice_list voices;
+static const struct voice_choice *active_voice;
 
 static void die(const char *fmt, ...)
 {
@@ -182,11 +186,66 @@ static void enqueue(enum item_type type,const char*text,int value){struct item*i
 static void clear_queue(void){struct item*i,*n;pthread_mutex_lock(&queue_lock);for(i=head;i;i=n){n=i->next;free(i->text);free(i);}head=tail=NULL;generation++;pthread_cond_broadcast(&queue_ready);pthread_mutex_unlock(&queue_lock);audio_flush();send_frame(CMD_CANCEL,"",0);}
 static void *worker(void *unused){(void)unused;while(!stopping){struct item*i;unsigned gen;pthread_mutex_lock(&queue_lock);while(!head&&!stopping)pthread_cond_wait(&queue_ready,&queue_lock);i=head;if(i){head=i->next;if(!head)tail=NULL;}gen=generation;pthread_mutex_unlock(&queue_lock);if(!i)continue;if(i->type==ITEM_MARK)audio_mark(i->value);else if(i->type==ITEM_PARAMS)send_frame(CMD_PARAMS,i->text,strlen(i->text));else{char type,*p;uint32_t n;send_frame(CMD_SPEAK,i->text,strlen(i->text));do{if(read_frame(&type,&p,&n)){stopping=1;break;}if(type==FRAME_AUDIO)audio_write(p,n,gen,&generation);else if(type==FRAME_MARK)audio_mark(atoi(p));else if(type==FRAME_ERROR)fprintf(stderr,"Cerence: %s\n",p);free(p);}while(type!=FRAME_DONE&&!stopping);}free(i->text);free(i);}return NULL;}
 
-static void select_voice(const struct filters *filters)
-{char type,*p;uint32_t n;char best_voice[128]="",best_vop[128]="";int best=-1;send_frame(CMD_LIST,"",0);while(!read_frame(&type,&p,&n)){if(type==FRAME_LIST){free(p);break;}if(type==FRAME_VOICE){char*a=strchr(p,'\t'),*b=a?strchr(a+1,'\t'):NULL;if(a&&b){*a++=0;*b++=0;const char*q=quality_name(b);int rank=!strcmp(q,"highest")?3:!strcmp(q,"enhanced")?2:!strcmp(q,"intermediate")?1:0;if((!filters->lang||!strcasecmp(p,filters->lang))&&(!filters->quality||!strcasecmp(q,quality_name(filters->quality)))&&rank>best){snprintf(best_voice,sizeof best_voice,"%s",a);snprintf(best_vop,sizeof best_vop,"%s",b);best=rank;}}}free(p);}if(best<0)die("no installed voice has all requested attributes");char params[300];snprintf(params,sizeof params,"voice=%s\nvop=%s\n",best_voice,best_vop);enqueue(ITEM_PARAMS,params,0);fprintf(stderr,"Using %s (%s)\n",best_voice,best_vop);}
+static int quality_rank(const char *quality)
+{
+    return !strcmp(quality, "highest") ? 3 :
+           !strcmp(quality, "enhanced") ? 2 :
+           !strcmp(quality, "intermediate") ? 1 : 0;
+}
+
+static void activate_voice(int number)
+{
+    const struct voice_choice *choice = voice_list_select(&voices, number);
+    char params[300];
+
+    if (!choice || choice == active_voice)
+        return;
+    snprintf(params, sizeof params, "voice=%s\nvop=%s\n", choice->name,
+             choice->operating_point);
+    enqueue(ITEM_PARAMS, params, 0);
+    active_voice = choice;
+    fprintf(stderr, "Using voice %zu: %s (%s)\n",
+            (size_t)(choice - voices.items) + 1, choice->name,
+            choice->operating_point);
+}
+
+static void select_voices(const struct filters *filters)
+{
+    char type, *payload;
+    uint32_t length;
+
+    send_frame(CMD_LIST, "", 0);
+    while (!read_frame(&type, &payload, &length)) {
+        if (type == FRAME_LIST) {
+            free(payload);
+            break;
+        }
+        if (type == FRAME_VOICE) {
+            char *name = strchr(payload, '\t');
+            char *operating_point = name ? strchr(name + 1, '\t') : NULL;
+            if (name && operating_point) {
+                const char *quality;
+                *name++ = '\0';
+                *operating_point++ = '\0';
+                quality = quality_name(operating_point);
+                if ((!filters->lang || !strcasecmp(payload, filters->lang)) &&
+                    (!filters->quality ||
+                     !strcasecmp(quality, quality_name(filters->quality))) &&
+                    voice_list_add(&voices, payload, name, operating_point,
+                                   quality_rank(quality)) < 0)
+                    die("out of memory");
+            }
+        }
+        free(payload);
+    }
+    if (!voices.count)
+        die("no installed voice has all requested attributes");
+    voice_list_sort(&voices);
+    activate_voice(1);
+}
 
 static void process_bytes(char *buf,ssize_t n)
-{ssize_t i=0,start=0;while(i<n){unsigned char c=buf[i];if(c==0x18){if(i>start){char save=buf[i];buf[i]=0;enqueue(ITEM_TEXT,buf+start,0);buf[i]=save;}clear_queue();i++;start=i;continue;}if(c==1){ssize_t j=i+1;int sign=0,value=0;if(i>start){char save=buf[i];buf[i]=0;enqueue(ITEM_TEXT,buf+start,0);buf[i]=save;}if(j<n&&(buf[j]=='+'||buf[j]=='-'))sign=buf[j++];while(j<n&&buf[j]>='0'&&buf[j]<='9')value=value*10+buf[j++]-'0';if(j>=n)break;switch(buf[j]){case'i':enqueue(ITEM_MARK,NULL,value);break;case's':{char p[64];int r=value*100/5;if(r<50)r=50;if(r>400)r=400;snprintf(p,sizeof p,"rate=%d\n",r);enqueue(ITEM_PARAMS,p,0);break;}case'p':{char p[64];int v=50+value*3/2;if(v>200)v=200;snprintf(p,sizeof p,"pitch=%d\n",v);enqueue(ITEM_PARAMS,p,0);break;}case'v':{char p[64];int v=value*2;if(v>100)v=100;snprintf(p,sizeof p,"volume=%d\n",v);enqueue(ITEM_PARAMS,p,0);break;}case'P':clear_queue();break;default:break;}(void)sign;i=j+1;start=i;continue;}i++;}if(i>start){char *text=strndup(buf+start,i-start);enqueue(ITEM_TEXT,text,0);free(text);}}
+{ssize_t i=0,start=0;while(i<n){unsigned char c=buf[i];if(c==0x18){if(i>start){char save=buf[i];buf[i]=0;enqueue(ITEM_TEXT,buf+start,0);buf[i]=save;}clear_queue();i++;start=i;continue;}if(c==1){ssize_t j=i+1;int sign=0,value=0;if(i>start){char save=buf[i];buf[i]=0;enqueue(ITEM_TEXT,buf+start,0);buf[i]=save;}if(j<n&&(buf[j]=='+'||buf[j]=='-'))sign=buf[j++];while(j<n&&buf[j]>='0'&&buf[j]<='9')value=value*10+buf[j++]-'0';if(j>=n)break;switch(buf[j]){case'i':enqueue(ITEM_MARK,NULL,value);break;case's':{char p[64];int r=value*100/5;if(r<50)r=50;if(r>400)r=400;snprintf(p,sizeof p,"rate=%d\n",r);enqueue(ITEM_PARAMS,p,0);break;}case'p':{char p[64];int v=50+value*3/2;if(v>200)v=200;snprintf(p,sizeof p,"pitch=%d\n",v);enqueue(ITEM_PARAMS,p,0);break;}case'v':{char p[64];int v=value*2;if(v>100)v=100;snprintf(p,sizeof p,"volume=%d\n",v);enqueue(ITEM_PARAMS,p,0);break;}case'o':activate_voice(value);break;case'P':clear_queue();break;default:break;}(void)sign;i=j+1;start=i;continue;}i++;}if(i>start){char *text=strndup(buf+start,i-start);enqueue(ITEM_TEXT,text,0);free(text);}}
 
 static void on_signal(int sig){(void)sig;stopping=1;}
 static void usage(FILE*f){fprintf(f,"usage: speakup-cerence [--lang CODE] [--quality QUALITY]\n");}
@@ -210,7 +269,7 @@ int main(int argc, char **argv)
     spawn_host();
     audio_init(&argc, &argv);
     pthread_create(&thread, NULL, worker, NULL);
-    select_voice(&f);
+    select_voices(&f);
 
     synth_fd = open("/dev/softsynthu", O_RDWR | O_NONBLOCK);
     if (synth_fd < 0 && errno == ENOENT)
@@ -247,5 +306,6 @@ int main(int argc, char **argv)
     pw_context_destroy(audio.context);
     pw_thread_loop_destroy(audio.loop);
     pw_deinit();
+    voice_list_destroy(&voices);
     return 0;
 }
