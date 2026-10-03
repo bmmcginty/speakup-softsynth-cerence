@@ -6,9 +6,9 @@ espeakup/`LD_PRELOAD`/`pw-cat` chain with one native process and one small Wine
 bridge. The bridge remains resident, so Wine and the voice are not reopened
 for each utterance.
 
-The repository contains the 64-bit Cerence runtime in `lib/` and common
-engine data in `lib/data/`. Installed voices are user data rather than part of
-the source tree.
+The 64-bit Cerence runtime and data is not included in this repository. It should be extracted to the `./lib` directory.
+It can be found in any NVDA addon that provides these voices.
+Installed voices are user data rather than part of the source tree.
 
 ## Build
 
@@ -109,9 +109,6 @@ catalogue while the speech runtime is active.
 The engine licence belongs to the Wine prefix. Existing Cerence activation can
 be selected with `WINEPREFIX`; the bridge reports a licensing error if the
 engine cannot open a voice.
-
-The patches under `patches/speakup/` add the full-Unicode `/dev/softsynthu`
-path needed for supplementary code points and Unicode screen review.
 
 ## Test
 
