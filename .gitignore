@@ -1,0 +1,7 @@
+/build/
+/bin/speakup-cerence
+/bin/speakup-cerence-voice-manager
+/bin/wine-bridge-speakup-cerence.exe
+*.o
+__pycache__/
+*.pyc
