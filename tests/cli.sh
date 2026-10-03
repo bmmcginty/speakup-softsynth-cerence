@@ -7,6 +7,7 @@ trap 'rm -rf "$work"' EXIT
 file "$root/bin/speakup-cerence" | grep -q 'ELF 64-bit'
 file "$root/bin/wine-bridge-speakup-cerence.exe" | grep -q 'PE32+'
 test -x "$root/bin/speakup-cerence-voice-manager"
+"$root/bin/speakup-cerence" --help | grep -q -- '--device PATH'
 cat >"$work/voices.json" <<'JSON'
 [
  {"voice_name":"Alpha","lang_code":"AAA","language":"A","gender":"Female","voice_type":"embedded-compact","quality":"Lowest","package_name":"a.zip","package_hash":"0000000000000000000000000000000000000000","size_in_bytes":10,"download_url":"https://example.invalid/a.zip"},

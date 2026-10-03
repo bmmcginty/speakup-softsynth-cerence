@@ -75,6 +75,20 @@ reader. The user running this program needs read/write access to
 bin/speakup-cerence --lang MNC --quality enhanced
 ```
 
+For end-to-end testing without a Speakup device, `--device` accepts a regular
+file or named pipe containing the same text and control-byte stream that
+`/dev/softsynthu` would provide. The process waits for queued speech and
+PipeWire playback to drain after end-of-file.
+
+```sh
+printf 'Testing Cerence speech.\n' > /tmp/softsynth-input
+bin/speakup-cerence --device /tmp/softsynth-input --lang ENU
+
+mkfifo /tmp/softsynth-input.fifo
+bin/speakup-cerence --device /tmp/softsynth-input.fifo --lang ENU &
+printf 'Testing through a pipe.\n' > /tmp/softsynth-input.fifo
+```
+
 Installed voices matching the filters are ordered alphabetically by name, with
 the best installed quality retained when a name has several qualities. Voice 1
 is active at startup. Speakup values 1 through 6 select voices on the current

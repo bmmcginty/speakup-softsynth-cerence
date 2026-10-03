@@ -181,10 +181,23 @@ static void audio_flush(void){struct mark*m,*next;pthread_mutex_lock(&audio.lock
 /* -------------------------------------------------------------- synthesis */
 enum item_type { ITEM_TEXT, ITEM_MARK, ITEM_PARAMS };
 struct item { enum item_type type; char *text; int value; struct item *next; };
-static struct item *head,*tail;static pthread_mutex_t queue_lock=PTHREAD_MUTEX_INITIALIZER;static pthread_cond_t queue_ready=PTHREAD_COND_INITIALIZER;static volatile unsigned generation;
+static struct item *head,*tail;static bool worker_busy;static pthread_mutex_t queue_lock=PTHREAD_MUTEX_INITIALIZER;static pthread_cond_t queue_ready=PTHREAD_COND_INITIALIZER;static pthread_cond_t queue_idle=PTHREAD_COND_INITIALIZER;static volatile unsigned generation;
 static void enqueue(enum item_type type,const char*text,int value){struct item*i=calloc(1,sizeof*i);i->type=type;i->text=text?strdup(text):NULL;i->value=value;pthread_mutex_lock(&queue_lock);if(tail)tail->next=i;else head=i;tail=i;pthread_cond_signal(&queue_ready);pthread_mutex_unlock(&queue_lock);}
 static void clear_queue(void){struct item*i,*n;pthread_mutex_lock(&queue_lock);for(i=head;i;i=n){n=i->next;free(i->text);free(i);}head=tail=NULL;generation++;pthread_cond_broadcast(&queue_ready);pthread_mutex_unlock(&queue_lock);audio_flush();send_frame(CMD_CANCEL,"",0);}
-static void *worker(void *unused){(void)unused;while(!stopping){struct item*i;unsigned gen;pthread_mutex_lock(&queue_lock);while(!head&&!stopping)pthread_cond_wait(&queue_ready,&queue_lock);i=head;if(i){head=i->next;if(!head)tail=NULL;}gen=generation;pthread_mutex_unlock(&queue_lock);if(!i)continue;if(i->type==ITEM_MARK)audio_mark(i->value);else if(i->type==ITEM_PARAMS)send_frame(CMD_PARAMS,i->text,strlen(i->text));else{char type,*p;uint32_t n;send_frame(CMD_SPEAK,i->text,strlen(i->text));do{if(read_frame(&type,&p,&n)){stopping=1;break;}if(type==FRAME_AUDIO)audio_write(p,n,gen,&generation);else if(type==FRAME_MARK)audio_mark(atoi(p));else if(type==FRAME_ERROR)fprintf(stderr,"Cerence: %s\n",p);free(p);}while(type!=FRAME_DONE&&!stopping);}free(i->text);free(i);}return NULL;}
+static void *worker(void *unused){(void)unused;while(!stopping){struct item*i;unsigned gen;pthread_mutex_lock(&queue_lock);while(!head&&!stopping)pthread_cond_wait(&queue_ready,&queue_lock);i=head;if(i){head=i->next;if(!head)tail=NULL;worker_busy=true;}gen=generation;pthread_mutex_unlock(&queue_lock);if(!i)continue;if(i->type==ITEM_MARK)audio_mark(i->value);else if(i->type==ITEM_PARAMS)send_frame(CMD_PARAMS,i->text,strlen(i->text));else{char type,*p;uint32_t n;send_frame(CMD_SPEAK,i->text,strlen(i->text));do{if(read_frame(&type,&p,&n)){stopping=1;break;}if(type==FRAME_AUDIO)audio_write(p,n,gen,&generation);else if(type==FRAME_MARK)audio_mark(atoi(p));else if(type==FRAME_ERROR)fprintf(stderr,"Cerence: %s\n",p);free(p);}while(type!=FRAME_DONE&&!stopping);}free(i->text);free(i);pthread_mutex_lock(&queue_lock);worker_busy=false;pthread_cond_broadcast(&queue_idle);pthread_mutex_unlock(&queue_lock);}return NULL;}
+
+static void wait_until_spoken(void)
+{
+    pthread_mutex_lock(&queue_lock);
+    while ((head || worker_busy) && !stopping)
+        pthread_cond_wait(&queue_idle, &queue_lock);
+    pthread_mutex_unlock(&queue_lock);
+
+    pthread_mutex_lock(&audio.lock);
+    while (audio.used && !stopping)
+        pthread_cond_wait(&audio.space, &audio.lock);
+    pthread_mutex_unlock(&audio.lock);
+}
 
 static int quality_rank(const char *quality)
 {
@@ -247,11 +260,32 @@ static void select_voices(const struct filters *filters)
 static void process_bytes(char *buf,ssize_t n)
 {ssize_t i=0,start=0;while(i<n){unsigned char c=buf[i];if(c==0x18){if(i>start){char save=buf[i];buf[i]=0;enqueue(ITEM_TEXT,buf+start,0);buf[i]=save;}clear_queue();i++;start=i;continue;}if(c==1){ssize_t j=i+1;int sign=0,value=0;if(i>start){char save=buf[i];buf[i]=0;enqueue(ITEM_TEXT,buf+start,0);buf[i]=save;}if(j<n&&(buf[j]=='+'||buf[j]=='-'))sign=buf[j++];while(j<n&&buf[j]>='0'&&buf[j]<='9')value=value*10+buf[j++]-'0';if(j>=n)break;switch(buf[j]){case'i':enqueue(ITEM_MARK,NULL,value);break;case's':{char p[64];int r=value*100/5;if(r<50)r=50;if(r>400)r=400;snprintf(p,sizeof p,"rate=%d\n",r);enqueue(ITEM_PARAMS,p,0);break;}case'p':{char p[64];int v=50+value*3/2;if(v>200)v=200;snprintf(p,sizeof p,"pitch=%d\n",v);enqueue(ITEM_PARAMS,p,0);break;}case'v':{char p[64];int v=value*2;if(v>100)v=100;snprintf(p,sizeof p,"volume=%d\n",v);enqueue(ITEM_PARAMS,p,0);break;}case'o':activate_voice(value);break;case'P':clear_queue();break;default:break;}(void)sign;i=j+1;start=i;continue;}i++;}if(i>start){char *text=strndup(buf+start,i-start);enqueue(ITEM_TEXT,text,0);free(text);}}
 
+static int open_synth_device(const char *path)
+{
+    struct stat status;
+    int flags = O_RDWR | O_NONBLOCK;
+
+    if (!path) {
+        int fd = open("/dev/softsynthu", flags);
+        if (fd < 0 && errno == ENOENT)
+            fd = open("/dev/softsynth", flags);
+        return fd;
+    }
+    if (stat(path, &status) < 0)
+        return -1;
+    if (S_ISFIFO(status.st_mode))
+        flags = O_RDONLY;
+    else if (S_ISREG(status.st_mode))
+        flags = O_RDONLY | O_NONBLOCK;
+    return open(path, flags);
+}
+
 static void on_signal(int sig){(void)sig;stopping=1;}
-static void usage(FILE*f){fprintf(f,"usage: speakup-cerence [--lang CODE] [--quality QUALITY]\n");}
+static void usage(FILE*f){fprintf(f,"usage: speakup-cerence [--lang CODE] [--quality QUALITY] [--device PATH]\n");}
 int main(int argc, char **argv)
 {
     struct filters f = {0};
+    const char *device = NULL;
     int i;
     pthread_t thread;
 
@@ -260,6 +294,7 @@ int main(int argc, char **argv)
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--lang") && i + 1 < argc) f.lang = argv[++i];
         else if (!strcmp(argv[i], "--quality") && i + 1 < argc) f.quality = argv[++i];
+        else if (!strcmp(argv[i], "--device") && i + 1 < argc) device = argv[++i];
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(stdout); return 0; }
         else { usage(stderr); return 2; }
     }
@@ -271,11 +306,10 @@ int main(int argc, char **argv)
     pthread_create(&thread, NULL, worker, NULL);
     select_voices(&f);
 
-    synth_fd = open("/dev/softsynthu", O_RDWR | O_NONBLOCK);
-    if (synth_fd < 0 && errno == ENOENT)
-        synth_fd = open("/dev/softsynth", O_RDWR | O_NONBLOCK);
+    synth_fd = open_synth_device(device);
     if (synth_fd < 0)
-        die("cannot open /dev/softsynthu: %s", strerror(errno));
+        die("cannot open %s: %s", device ? device : "/dev/softsynthu",
+            strerror(errno));
 
     while (!stopping) {
         struct pollfd p = {synth_fd, POLLIN, 0};
@@ -286,12 +320,18 @@ int main(int argc, char **argv)
             if (n > 0) {
                 buf[n] = 0;
                 process_bytes(buf, n);
-            } else if (n < 0 && errno != EAGAIN && errno != EINTR) {
+            } else if (n == 0) {
+                break;
+            } else if (errno != EAGAIN && errno != EINTR) {
                 break;
             }
+        } else if (rc > 0 && (p.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+            break;
         }
     }
 
+    if (!stopping)
+        wait_until_spoken();
     stopping = 1;
     pthread_cond_broadcast(&queue_ready);
     clear_queue();
