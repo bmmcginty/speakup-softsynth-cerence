@@ -141,7 +141,7 @@ static void spawn_host(void)
 
 /* ------------------------------------------------------------- PipeWire */
 struct mark { uint64_t at; int value; struct mark *next; };
-struct audio_state { struct pw_thread_loop *loop; struct pw_context *context; struct pw_core *core; struct pw_stream *stream; struct spa_hook listener; pthread_mutex_t lock; pthread_cond_t space; unsigned char data[AUDIO_CAP]; size_t rd, used; uint64_t written, played; struct mark *marks; } audio = { .lock=PTHREAD_MUTEX_INITIALIZER, .space=PTHREAD_COND_INITIALIZER };
+struct audio_state { struct pw_thread_loop *loop; struct pw_context *context; struct pw_core *core; struct pw_stream *stream; struct spa_hook listener; pthread_mutex_t lock; pthread_cond_t space, drain_done; unsigned char data[AUDIO_CAP]; size_t rd, used; uint64_t written, played; struct mark *marks; bool drained; } audio = { .lock=PTHREAD_MUTEX_INITIALIZER, .space=PTHREAD_COND_INITIALIZER, .drain_done=PTHREAD_COND_INITIALIZER };
 
 static void audio_process(void *unused)
 {
@@ -165,9 +165,17 @@ static void audio_process(void *unused)
     d->chunk->offset = 0;
     d->chunk->stride = 2;
     d->chunk->size = want;
-    while(audio.marks&&audio.marks->at<=audio.played){struct mark*m=audio.marks;audio.marks=m->next;if(synth_fd>=0){char s[24];int n=snprintf(s,sizeof s,"%d",m->value);write(synth_fd,s,n);}free(m);}pthread_cond_broadcast(&audio.space);pthread_mutex_unlock(&audio.lock);pw_stream_queue_buffer(audio.stream,pb);
+    while(audio.marks&&audio.marks->at<=audio.played){struct mark*m=audio.marks;audio.marks=m->next;if(synth_fd>=0){char s[24];int n=snprintf(s,sizeof s,"%d",m->value);write(synth_fd,s,n);}free(m);}pw_stream_queue_buffer(audio.stream,pb);pthread_cond_broadcast(&audio.space);pthread_mutex_unlock(&audio.lock);
 }
-static const struct pw_stream_events stream_events={PW_VERSION_STREAM_EVENTS,.process=audio_process};
+static void audio_drained(void *unused)
+{
+    (void)unused;
+    pthread_mutex_lock(&audio.lock);
+    audio.drained = true;
+    pthread_cond_broadcast(&audio.drain_done);
+    pthread_mutex_unlock(&audio.lock);
+}
+static const struct pw_stream_events stream_events={PW_VERSION_STREAM_EVENTS,.process=audio_process,.drained=audio_drained};
 static void audio_init(int *argc,char ***argv)
 {
     struct spa_audio_info_raw info={.format=SPA_AUDIO_FORMAT_S16_LE,.rate=RATE,.channels=1,.position={SPA_AUDIO_CHANNEL_MONO}};uint8_t buffer[1024];struct spa_pod_builder b=SPA_POD_BUILDER_INIT(buffer,sizeof buffer);const struct spa_pod *params[1];
@@ -196,7 +204,15 @@ static void wait_until_spoken(void)
     pthread_mutex_lock(&audio.lock);
     while (audio.used && !stopping)
         pthread_cond_wait(&audio.space, &audio.lock);
+    audio.drained = false;
     pthread_mutex_unlock(&audio.lock);
+
+    if (!stopping && pw_stream_flush(audio.stream, true) >= 0) {
+        pthread_mutex_lock(&audio.lock);
+        while (!audio.drained && !stopping)
+            pthread_cond_wait(&audio.drain_done, &audio.lock);
+        pthread_mutex_unlock(&audio.lock);
+    }
 }
 
 static int quality_rank(const char *quality)
