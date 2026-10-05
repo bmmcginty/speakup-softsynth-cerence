@@ -18,6 +18,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "speakup-scale.h"
 #include "voice-list.h"
 
 #define RATE 22050
@@ -274,7 +275,7 @@ static void select_voices(const struct filters *filters)
 }
 
 static void process_bytes(char *buf,ssize_t n)
-{ssize_t i=0,start=0;while(i<n){unsigned char c=buf[i];if(c==0x18){if(i>start){char save=buf[i];buf[i]=0;enqueue(ITEM_TEXT,buf+start,0);buf[i]=save;}clear_queue();i++;start=i;continue;}if(c==1){ssize_t j=i+1;int sign=0,value=0;if(i>start){char save=buf[i];buf[i]=0;enqueue(ITEM_TEXT,buf+start,0);buf[i]=save;}if(j<n&&(buf[j]=='+'||buf[j]=='-'))sign=buf[j++];while(j<n&&buf[j]>='0'&&buf[j]<='9')value=value*10+buf[j++]-'0';if(j>=n)break;switch(buf[j]){case'i':enqueue(ITEM_MARK,NULL,value);break;case's':{char p[64];int r=value*100/5;if(r<50)r=50;if(r>400)r=400;snprintf(p,sizeof p,"rate=%d\n",r);enqueue(ITEM_PARAMS,p,0);break;}case'p':{char p[64];int v=50+value*3/2;if(v>200)v=200;snprintf(p,sizeof p,"pitch=%d\n",v);enqueue(ITEM_PARAMS,p,0);break;}case'v':{char p[64];int v=value*2;if(v>100)v=100;snprintf(p,sizeof p,"volume=%d\n",v);enqueue(ITEM_PARAMS,p,0);break;}case'o':activate_voice(value);break;case'P':clear_queue();break;default:break;}(void)sign;i=j+1;start=i;continue;}i++;}if(i>start){char *text=strndup(buf+start,i-start);enqueue(ITEM_TEXT,text,0);free(text);}}
+{ssize_t i=0,start=0;while(i<n){unsigned char c=buf[i];if(c==0x18){if(i>start){char save=buf[i];buf[i]=0;enqueue(ITEM_TEXT,buf+start,0);buf[i]=save;}clear_queue();i++;start=i;continue;}if(c==1){ssize_t j=i+1;int sign=0,value=0;if(i>start){char save=buf[i];buf[i]=0;enqueue(ITEM_TEXT,buf+start,0);buf[i]=save;}if(j<n&&(buf[j]=='+'||buf[j]=='-'))sign=buf[j++];while(j<n&&buf[j]>='0'&&buf[j]<='9')value=value*10+buf[j++]-'0';if(j>=n)break;switch(buf[j]){case'i':enqueue(ITEM_MARK,NULL,value);break;case's':{char p[64];snprintf(p,sizeof p,"rate=%d\n",speakup_scale_rate(value));enqueue(ITEM_PARAMS,p,0);break;}case'p':{char p[64];snprintf(p,sizeof p,"pitch=%d\n",speakup_scale_pitch(value));enqueue(ITEM_PARAMS,p,0);break;}case'v':{char p[64];snprintf(p,sizeof p,"volume=%d\n",speakup_scale_volume(value));enqueue(ITEM_PARAMS,p,0);break;}case'o':activate_voice(value);break;case'P':clear_queue();break;default:break;}(void)sign;i=j+1;start=i;continue;}i++;}if(i>start){char *text=strndup(buf+start,i-start);enqueue(ITEM_TEXT,text,0);free(text);}}
 
 static int open_synth_device(const char *path)
 {
