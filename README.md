@@ -37,7 +37,7 @@ The locations can be overridden with `SPEAKUP_CERENCE_LIB`, `SPEAKUP_CERENCE_DAT
 executable. The bridge also accepts explicit `--lib-dir`, `--data-dir`, and
 `--store` options. Per-voice rate and volume are kept in
 `voice-settings` beside the voice store; `SPEAKUP_CERENCE_SETTINGS` overrides
-that path.
+that path. `SPEAKUP_CERENCE_LOG` selects the log file.
 
 ## Voices
 
@@ -80,6 +80,13 @@ bin/speakup-cerence --lang MNC --quality enhanced
 The driver detaches from the terminal and keeps running in the background. Add
 `--foreground` to keep it attached to the current terminal, for example while
 debugging or when a service manager supervises it.
+
+Because a background process has no terminal to complain on, the driver also
+appends diagnostics to
+`${XDG_STATE_HOME:-~/.local/state}/speakup-cerence/speakup-cerence.log`. Use
+`--log FILE` or `SPEAKUP_CERENCE_LOG` to choose another file, or `--log -` for
+standard error only. `--foreground` writes to the log and to the terminal.
+Wine bridge errors are captured in the same log.
 
 For end-to-end testing without a Speakup device, `--device` accepts a regular
 file or named pipe containing the same text and control-byte stream that

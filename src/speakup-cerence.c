@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "speakup-scale.h"
@@ -48,15 +49,103 @@ static volatile sig_atomic_t reload_requested;
 static int speakup_rate = 2;
 static int speakup_volume = 5;
 static int speakup_pitch = 5;
+static int log_fd = -1;
+static FILE *log_file;
+static int log_console;
+
+/* --------------------------------------------------------------- logging */
+
+static void log_vmsg(const char *fmt, va_list ap)
+{
+    va_list copy;
+
+    if (log_file) {
+        va_copy(copy, ap);
+        vfprintf(log_file, fmt, copy);
+        va_end(copy);
+        fflush(log_file);
+    }
+    if (log_console) {
+        va_copy(copy, ap);
+        vfprintf(stderr, fmt, copy);
+        va_end(copy);
+    }
+}
+
+static void log_msg(const char *fmt, ...)
+{
+    va_list ap;
+
+    if (log_file) {
+        char stamp[32];
+        time_t now = time(NULL);
+        struct tm broken_down;
+        localtime_r(&now, &broken_down);
+        strftime(stamp, sizeof stamp, "%Y-%m-%dT%H:%M:%S ", &broken_down);
+        fputs(stamp, log_file);
+    }
+    va_start(ap, fmt);
+    log_vmsg(fmt, ap);
+    va_end(ap);
+}
+
+/* Open the log file, creating its directory.  A path of "-" or NULL means
+ * standard error only, which is what a foreground run wants. */
+static void log_open(const char *path, int console)
+{
+    char directory[4096];
+    char *slash;
+
+    log_console = console;
+    if (!path || !*path || !strcmp(path, "-")) {
+        log_console = 1;
+        return;
+    }
+    snprintf(directory, sizeof directory, "%s", path);
+    slash = strrchr(directory, '/');
+    if (slash) {
+        *slash = '\0';
+        mkdir(directory, 0700);
+    }
+    log_fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (log_fd < 0)
+        return;
+    log_file = fdopen(log_fd, "a");
+    if (!log_file) {
+        close(log_fd);
+        log_fd = -1;
+    }
+}
+
+static const char *log_default_path(char *buffer, size_t size)
+{
+    const char *state_home = getenv("XDG_STATE_HOME");
+    const char *home = getenv("HOME");
+
+    if (state_home && *state_home) {
+        if (snprintf(buffer, size, "%s/speakup-cerence/speakup-cerence.log",
+                     state_home) >= (int)size)
+            return NULL;
+        return buffer;
+    }
+    if (!home || !*home)
+        return NULL;
+    if (snprintf(buffer, size,
+                 "%s/.local/state/speakup-cerence/speakup-cerence.log",
+                 home) >= (int)size)
+        return NULL;
+    return buffer;
+}
 
 static void die(const char *fmt, ...)
 {
+    char message[1024];
     va_list ap;
+
     va_start(ap, fmt);
-    fputs("speakup-cerence: ", stderr);
-    vfprintf(stderr, fmt, ap);
-    fputc('\n', stderr);
+    vsnprintf(message, sizeof message, fmt, ap);
     va_end(ap);
+    log_msg("speakup-cerence: %s\n", message);
     exit(1);
 }
 
@@ -181,8 +270,9 @@ static void spawn_host(void)
     host.pid = fork();
     if (host.pid < 0)
         die("fork: %s", strerror(errno));
-    if(!host.pid){dup2(a[0],0);dup2(b[1],1);close(a[0]);close(a[1]);close(b[0]);close(b[1]);setenv("WINEDEBUG","-all",0);execlp(wine,wine,exe,"--lib-dir",lib,"--data-dir",data,"--store",store,"--serve",NULL);_exit(127);}
+    if(!host.pid){if(log_fd>=0)dup2(log_fd,2);dup2(a[0],0);dup2(b[1],1);close(a[0]);close(a[1]);close(b[0]);close(b[1]);setenv("WINEDEBUG","-all",0);execlp(wine,wine,exe,"--lib-dir",lib,"--data-dir",data,"--store",store,"--serve",NULL);_exit(127);}
     close(a[0]);close(b[1]);host.in=a[1];host.out=b[0]; if(read_frame(&type,&payload,&n)||type!='R')die("Wine bridge did not become ready");free(payload);
+    log_msg("Cerence bridge ready\n");
 }
 
 /* Ask the bridge to quit and reap it.  The caller must already have stopped the
@@ -254,7 +344,7 @@ struct item { enum item_type type; char *text; int value; struct item *next; };
 static struct item *head,*tail;static bool worker_busy;static pthread_mutex_t queue_lock=PTHREAD_MUTEX_INITIALIZER;static pthread_cond_t queue_ready=PTHREAD_COND_INITIALIZER;static pthread_cond_t queue_idle=PTHREAD_COND_INITIALIZER;static volatile unsigned generation;
 static void enqueue(enum item_type type,const char*text,int value){struct item*i=calloc(1,sizeof*i);i->type=type;i->text=text?strdup(text):NULL;i->value=value;pthread_mutex_lock(&queue_lock);if(tail)tail->next=i;else head=i;tail=i;pthread_cond_signal(&queue_ready);pthread_mutex_unlock(&queue_lock);}
 static void clear_queue(void){struct item*i,*n;pthread_mutex_lock(&queue_lock);for(i=head;i;i=n){n=i->next;free(i->text);free(i);}head=tail=NULL;generation++;pthread_cond_broadcast(&queue_ready);pthread_mutex_unlock(&queue_lock);audio_flush();send_frame(CMD_CANCEL,"",0);}
-static void *worker(void *unused){(void)unused;while(!stopping){struct item*i;unsigned gen;pthread_mutex_lock(&queue_lock);while(!head&&!stopping)pthread_cond_wait(&queue_ready,&queue_lock);i=head;if(i){head=i->next;if(!head)tail=NULL;worker_busy=true;}gen=generation;pthread_mutex_unlock(&queue_lock);if(!i)continue;if(i->type==ITEM_MARK)audio_mark(i->value);else if(i->type==ITEM_PARAMS)send_frame(CMD_PARAMS,i->text,strlen(i->text));else{char type,*p;uint32_t n;send_frame(CMD_SPEAK,i->text,strlen(i->text));do{if(read_frame(&type,&p,&n)){stopping=1;break;}if(type==FRAME_AUDIO)audio_write(p,n,gen,&generation);else if(type==FRAME_MARK)audio_mark(atoi(p));else if(type==FRAME_ERROR)fprintf(stderr,"Cerence: %s\n",p);free(p);}while(type!=FRAME_DONE&&!stopping);}free(i->text);free(i);pthread_mutex_lock(&queue_lock);worker_busy=false;pthread_cond_broadcast(&queue_idle);pthread_mutex_unlock(&queue_lock);}return NULL;}
+static void *worker(void *unused){(void)unused;while(!stopping){struct item*i;unsigned gen;pthread_mutex_lock(&queue_lock);while(!head&&!stopping)pthread_cond_wait(&queue_ready,&queue_lock);i=head;if(i){head=i->next;if(!head)tail=NULL;worker_busy=true;}gen=generation;pthread_mutex_unlock(&queue_lock);if(!i)continue;if(i->type==ITEM_MARK)audio_mark(i->value);else if(i->type==ITEM_PARAMS)send_frame(CMD_PARAMS,i->text,strlen(i->text));else{char type,*p;uint32_t n;send_frame(CMD_SPEAK,i->text,strlen(i->text));do{if(read_frame(&type,&p,&n)){stopping=1;break;}if(type==FRAME_AUDIO)audio_write(p,n,gen,&generation);else if(type==FRAME_MARK)audio_mark(atoi(p));else if(type==FRAME_ERROR)log_msg("Cerence: %s\n",p);free(p);}while(type!=FRAME_DONE&&!stopping);}free(i->text);free(i);pthread_mutex_lock(&queue_lock);worker_busy=false;pthread_cond_broadcast(&queue_idle);pthread_mutex_unlock(&queue_lock);}return NULL;}
 
 static void wait_until_spoken(void)
 {
@@ -321,7 +411,7 @@ static void activate_voice(int number)
         return;
     send_voice_params(choice);
     active_voice = choice;
-    fprintf(stderr, "Using voice %zu: %s (%s)\n",
+    log_msg("Using voice %zu: %s (%s)\n",
             (size_t)(choice - voices.items) + 1, choice->name,
             choice->operating_point);
 }
@@ -348,6 +438,7 @@ static void fetch_voices(void)
     if (voice_store_scan(&installed, store) < 0)
         die("out of memory");
     store_fingerprint = installed.fingerprint;
+    log_msg("Found %zu installed voice(s) in %s\n", installed.count, store);
     for (i = 0; i < installed.count; i++) {
         const char *quality = quality_name(installed.items[i].operating_point);
         if ((!filters.lang ||
@@ -398,7 +489,7 @@ static void select_voices(void)
  * voice because the fresh bridge knows nothing about it. */
 static void restart_host(void)
 {
-    fprintf(stderr, "Reloading the Cerence bridge\n");
+    log_msg("Reloading the Cerence bridge\n");
     clear_queue();
     wait_worker_idle();
     stop_host();
@@ -421,8 +512,7 @@ static void change_voice(int number)
     if (store_fingerprint != host_store_fingerprint)
         restart_host();
     if (!voices.count) {
-        fprintf(stderr, "speakup-cerence: no installed voice matches the "
-                "requested filters\n");
+        log_msg("no installed voice matches the requested filters\n");
         return;
     }
     activate_voice(number);
@@ -485,10 +575,12 @@ static void daemonize(void)
     }
 }
 
-static void usage(FILE*f){fprintf(f,"usage: speakup-cerence [--lang CODE] [--quality QUALITY] [--device PATH] [--foreground]\n");}
+static void usage(FILE*f){fprintf(f,"usage: speakup-cerence [--lang CODE] [--quality QUALITY] [--device PATH] [--log FILE] [--foreground]\n");}
 int main(int argc, char **argv)
 {
     const char *device = NULL;
+    const char *log_path = NULL;
+    char default_log[4096];
     int foreground = 0;
     int i;
     pthread_t thread;
@@ -499,10 +591,20 @@ int main(int argc, char **argv)
         if (!strcmp(argv[i], "--lang") && i + 1 < argc) filters.lang = argv[++i];
         else if (!strcmp(argv[i], "--quality") && i + 1 < argc) filters.quality = argv[++i];
         else if (!strcmp(argv[i], "--device") && i + 1 < argc) device = argv[++i];
+        else if (!strcmp(argv[i], "--log") && i + 1 < argc) log_path = argv[++i];
         else if (!strcmp(argv[i], "--foreground")) foreground = 1;
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(stdout); return 0; }
         else { usage(stderr); return 2; }
     }
+    if (!log_path)
+        log_path = getenv("SPEAKUP_CERENCE_LOG");
+    if (log_path && !*log_path)
+        log_path = NULL;
+    if (!log_path)
+        log_path = log_default_path(default_log, sizeof default_log);
+    log_open(log_path, foreground);
+    log_msg("speakup-cerence starting (log %s)\n",
+            log_path ? log_path : "standard error");
     settings_path_init();
     voice_settings_load(&voice_settings, settings_path);
     if (!foreground)
