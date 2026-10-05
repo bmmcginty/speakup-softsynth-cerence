@@ -88,6 +88,7 @@ static const char *root_path(const char *env, const char *suffix, char *buf, siz
 }
 
 struct filters { const char *lang, *quality; };
+static struct filters filters;
 
 static const char *quality_name(const char *value)
 {
@@ -258,6 +259,17 @@ static void wait_until_spoken(void)
     }
 }
 
+/* The worker owns the host protocol while it reads an utterance.  Callers that
+ * want to send their own commands, such as a voice-list refresh, must wait for
+ * it to finish first so the two never read the same frames. */
+static void wait_worker_idle(void)
+{
+    pthread_mutex_lock(&queue_lock);
+    while ((head || worker_busy) && !stopping)
+        pthread_cond_wait(&queue_idle, &queue_lock);
+    pthread_mutex_unlock(&queue_lock);
+}
+
 static int quality_rank(const char *quality)
 {
     return !strcmp(quality, "highest") ? 3 :
@@ -291,14 +303,29 @@ static void activate_voice(int number)
             choice->operating_point);
 }
 
-static void select_voices(const struct filters *filters)
+static void fetch_voices(void)
 {
+    struct voice_list fresh = {0};
+    char keep_name[VOICE_FIELD_SIZE] = "";
+    char keep_operating_point[VOICE_FIELD_SIZE] = "";
+    size_t page_start = voices.page_start;
     char type, *payload;
     uint32_t length;
+    size_t i;
+    int complete = 0;
+
+    /* Sorting reorders the array, so remember the active voice by value and
+     * re-resolve it after the rebuild. */
+    if (active_voice) {
+        snprintf(keep_name, sizeof keep_name, "%s", active_voice->name);
+        snprintf(keep_operating_point, sizeof keep_operating_point, "%s",
+                 active_voice->operating_point);
+    }
 
     send_frame(CMD_LIST, "", 0);
     while (!read_frame(&type, &payload, &length)) {
         if (type == FRAME_LIST) {
+            complete = 1;
             free(payload);
             break;
         }
@@ -310,24 +337,76 @@ static void select_voices(const struct filters *filters)
                 *name++ = '\0';
                 *operating_point++ = '\0';
                 quality = quality_name(operating_point);
-                if ((!filters->lang || !strcasecmp(payload, filters->lang)) &&
-                    (!filters->quality ||
-                     !strcasecmp(quality, quality_name(filters->quality))) &&
-                    voice_list_add(&voices, payload, name, operating_point,
-                                   quality_rank(quality)) < 0)
+                if ((!filters.lang ||
+                     !strcasecmp(payload, filters.lang)) &&
+                    (!filters.quality ||
+                     !strcasecmp(quality, quality_name(filters.quality))) &&
+                    voice_list_add(&fresh, payload, name, operating_point,
+                                   quality_rank(quality)) < 0) {
+                    free(payload);
+                    voice_list_destroy(&fresh);
                     die("out of memory");
+                }
             }
         }
         free(payload);
     }
+    if (!complete) {
+        /* The engine did not answer; keep the voices we already have. */
+        voice_list_destroy(&fresh);
+        return;
+    }
+
+    voice_list_sort(&fresh);
+    fresh.page_start = page_start;
+    if (fresh.page_start >= fresh.count)
+        fresh.page_start = fresh.count ? ((fresh.count - 1) / 6) * 6 : 0;
+    voice_list_destroy(&voices);
+    voices = fresh;
+
+    active_voice = NULL;
+    if (keep_name[0]) {
+        for (i = 0; i < voices.count; i++) {
+            if (!strcasecmp(voices.items[i].name, keep_name) &&
+                !strcasecmp(voices.items[i].operating_point,
+                            keep_operating_point)) {
+                active_voice = &voices.items[i];
+                break;
+            }
+        }
+    }
+    if (!active_voice && voices.count)
+        active_voice = &voices.items[0];
+}
+
+static void select_voices(void)
+{
+    fetch_voices();
     if (!voices.count)
         die("no installed voice has all requested attributes");
-    voice_list_sort(&voices);
     activate_voice(1);
 }
 
+/* A set-voice command is also the signal that a new voice package may have
+ * appeared, since the voice store is user data that can change while the
+ * driver runs.  Cancel any speech in progress, re-read the list and then map
+ * the requested number onto it. */
+static void change_voice(int number)
+{
+    settings_flush();
+    clear_queue();
+    wait_worker_idle();
+    fetch_voices();
+    if (!voices.count) {
+        fprintf(stderr, "speakup-cerence: no installed voice matches the "
+                "requested filters\n");
+        return;
+    }
+    activate_voice(number);
+}
+
 static void process_bytes(char *buf,ssize_t n)
-{ssize_t i=0,start=0;while(i<n){unsigned char c=buf[i];if(c==0x18){if(i>start){char save=buf[i];buf[i]=0;enqueue(ITEM_TEXT,buf+start,0);buf[i]=save;}clear_queue();i++;start=i;continue;}if(c==1){ssize_t j=i+1;int sign=0,value=0;if(i>start){char save=buf[i];buf[i]=0;enqueue(ITEM_TEXT,buf+start,0);buf[i]=save;}if(j<n&&(buf[j]=='+'||buf[j]=='-'))sign=buf[j++];while(j<n&&buf[j]>='0'&&buf[j]<='9')value=value*10+buf[j++]-'0';if(j>=n)break;switch(buf[j]){case'i':enqueue(ITEM_MARK,NULL,value);break;case's':{char p[64];speakup_rate=value;if(active_voice)settings_update(active_voice->name,speakup_rate,speakup_volume);snprintf(p,sizeof p,"rate=%d\n",speakup_scale_rate(value));enqueue(ITEM_PARAMS,p,0);break;}case'p':{char p[64];snprintf(p,sizeof p,"pitch=%d\n",speakup_scale_pitch(value));enqueue(ITEM_PARAMS,p,0);break;}case'v':{char p[64];speakup_volume=value;if(active_voice)settings_update(active_voice->name,speakup_rate,speakup_volume);snprintf(p,sizeof p,"volume=%d\n",speakup_scale_volume(value));enqueue(ITEM_PARAMS,p,0);break;}case'o':activate_voice(value);break;case'P':clear_queue();break;default:break;}(void)sign;i=j+1;start=i;continue;}i++;}if(i>start){char *text=strndup(buf+start,i-start);enqueue(ITEM_TEXT,text,0);free(text);}}
+{ssize_t i=0,start=0;while(i<n){unsigned char c=buf[i];if(c==0x18){if(i>start){char save=buf[i];buf[i]=0;enqueue(ITEM_TEXT,buf+start,0);buf[i]=save;}clear_queue();i++;start=i;continue;}if(c==1){ssize_t j=i+1;int sign=0,value=0;if(i>start){char save=buf[i];buf[i]=0;enqueue(ITEM_TEXT,buf+start,0);buf[i]=save;}if(j<n&&(buf[j]=='+'||buf[j]=='-'))sign=buf[j++];while(j<n&&buf[j]>='0'&&buf[j]<='9')value=value*10+buf[j++]-'0';if(j>=n)break;switch(buf[j]){case'i':enqueue(ITEM_MARK,NULL,value);break;case's':{char p[64];speakup_rate=value;if(active_voice)settings_update(active_voice->name,speakup_rate,speakup_volume);snprintf(p,sizeof p,"rate=%d\n",speakup_scale_rate(value));enqueue(ITEM_PARAMS,p,0);break;}case'p':{char p[64];snprintf(p,sizeof p,"pitch=%d\n",speakup_scale_pitch(value));enqueue(ITEM_PARAMS,p,0);break;}case'v':{char p[64];speakup_volume=value;if(active_voice)settings_update(active_voice->name,speakup_rate,speakup_volume);snprintf(p,sizeof p,"volume=%d\n",speakup_scale_volume(value));enqueue(ITEM_PARAMS,p,0);break;}case'o':change_voice(value);break;case'P':clear_queue();break;default:break;}(void)sign;i=j+1;start=i;continue;}i++;}if(i>start){char *text=strndup(buf+start,i-start);enqueue(ITEM_TEXT,text,0);free(text);}}
 
 static int open_synth_device(const char *path)
 {
@@ -385,7 +464,6 @@ static void daemonize(void)
 static void usage(FILE*f){fprintf(f,"usage: speakup-cerence [--lang CODE] [--quality QUALITY] [--device PATH] [--foreground]\n");}
 int main(int argc, char **argv)
 {
-    struct filters f = {0};
     const char *device = NULL;
     int foreground = 0;
     int i;
@@ -394,8 +472,8 @@ int main(int argc, char **argv)
     find_installation_root();
 
     for (i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--lang") && i + 1 < argc) f.lang = argv[++i];
-        else if (!strcmp(argv[i], "--quality") && i + 1 < argc) f.quality = argv[++i];
+        if (!strcmp(argv[i], "--lang") && i + 1 < argc) filters.lang = argv[++i];
+        else if (!strcmp(argv[i], "--quality") && i + 1 < argc) filters.quality = argv[++i];
         else if (!strcmp(argv[i], "--device") && i + 1 < argc) device = argv[++i];
         else if (!strcmp(argv[i], "--foreground")) foreground = 1;
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(stdout); return 0; }
@@ -411,7 +489,7 @@ int main(int argc, char **argv)
     spawn_host();
     audio_init(&argc, &argv);
     pthread_create(&thread, NULL, worker, NULL);
-    select_voices(&f);
+    select_voices();
 
     synth_fd = open_synth_device(device);
     if (synth_fd < 0)

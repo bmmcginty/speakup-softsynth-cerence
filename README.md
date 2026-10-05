@@ -102,6 +102,8 @@ six-voice page, 7 advances to the next page, and 0 returns to the previous
 page. Selection is clamped at both ends: 0 returns to the startup voice on the
 first page, and unavailable positions on the final page select the last voice.
 This uses Speakup's existing 0–7 voice-control range without a kernel change.
+The installed voice list is re-read on every voice selection, so a package
+installed while the driver is running becomes selectable without a restart.
 
 Rate and volume are remembered per voice. Selecting a voice restores the last
 rate and volume used with it, and the table is saved beside the voice store so
