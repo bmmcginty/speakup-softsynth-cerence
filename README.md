@@ -35,7 +35,9 @@ to `${XDG_DATA_HOME:-~/.local/share}/speakup-cerence/voices`.
 The locations can be overridden with `SPEAKUP_CERENCE_LIB`, `SPEAKUP_CERENCE_DATA`,
 `SPEAKUP_CERENCE_VOICE_STORE`, and `SPEAKUP_CERENCE_BRIDGE`. `WINE` selects the Wine
 executable. The bridge also accepts explicit `--lib-dir`, `--data-dir`, and
-`--store` options.
+`--store` options. Per-voice rate and volume are kept in
+`voice-settings` beside the voice store; `SPEAKUP_CERENCE_SETTINGS` overrides
+that path.
 
 ## Voices
 
@@ -101,8 +103,15 @@ page. Selection is clamped at both ends: 0 returns to the startup voice on the
 first page, and unavailable positions on the final page select the last voice.
 This uses Speakup's existing 0–7 voice-control range without a kernel change.
 
+Rate and volume are remembered per voice. Selecting a voice restores the last
+rate and volume used with it, and the table is saved beside the voice store so
+it survives a restart. Voices with no saved entry inherit the values in effect
+when they are first selected.
+
 Speakup's flush, index, rate, pitch, volume, and pause commands are also handled
 directly. Indexes are written back when PipeWire reaches their audio position.
+Speakup sends rate, pitch and volume as 0–9 digits; the driver maps them onto
+the engine's rate (50–400), pitch (50–200) and volume (0–100) ranges.
 
 The Cerence engine cannot be opened safely by two Wine bridge processes at
 once. A second bridge now exits immediately with an "engine is already in use"

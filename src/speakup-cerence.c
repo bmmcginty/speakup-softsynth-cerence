@@ -20,6 +20,7 @@
 
 #include "speakup-scale.h"
 #include "voice-list.h"
+#include "voice-settings.h"
 
 #define RATE 22050
 #define AUDIO_CAP (RATE * 2 * 30)
@@ -40,6 +41,11 @@ static int synth_fd = -1;
 static char installation_root[4096];
 static struct voice_list voices;
 static const struct voice_choice *active_voice;
+static struct voice_settings voice_settings;
+static char settings_path[4096];
+static int settings_dirty;
+static int speakup_rate = 2;
+static int speakup_volume = 5;
 
 static void die(const char *fmt, ...)
 {
@@ -113,6 +119,42 @@ static const char *voice_store_path(char *buf, size_t size)
     if (snprintf(buf, size, "%s/.local/share/speakup-cerence/voices", home) >= (int)size)
         die("voice store path is too long");
     return buf;
+}
+
+/* ------------------------------------------------- per-voice preferences */
+
+static void settings_path_init(void)
+{
+    const char *configured = getenv("SPEAKUP_CERENCE_SETTINGS");
+    char directory[4096];
+    char *slash;
+
+    if (configured && *configured) {
+        snprintf(settings_path, sizeof settings_path, "%s", configured);
+        return;
+    }
+    voice_store_path(directory, sizeof directory);
+    slash = strrchr(directory, '/');
+    if (!slash)
+        die("cannot derive a settings file from %s", directory);
+    *slash = '\0';
+    mkdir(directory, 0700); /* the voice store parent may not exist yet */
+    if (snprintf(settings_path, sizeof settings_path, "%s/voice-settings",
+                 directory) >= (int)sizeof settings_path)
+        die("settings path is too long");
+}
+
+static void settings_update(const char *name, int rate, int volume)
+{
+    if (voice_settings_set(&voice_settings, name, rate, volume))
+        settings_dirty = 1;
+}
+
+static void settings_flush(void)
+{
+    if (settings_dirty &&
+        voice_settings_save(&voice_settings, settings_path) == 0)
+        settings_dirty = 0;
 }
 
 /* -------------------------------------------------------------- host IPC */
@@ -226,12 +268,22 @@ static int quality_rank(const char *quality)
 static void activate_voice(int number)
 {
     const struct voice_choice *choice = voice_list_select(&voices, number);
+    struct voice_setting *setting;
     char params[300];
+    int rate, volume;
 
-    if (!choice || choice == active_voice)
+    if (!choice)
         return;
-    snprintf(params, sizeof params, "voice=%s\nvop=%s\n", choice->name,
-             choice->operating_point);
+    setting = voice_settings_find(&voice_settings, choice->name);
+    rate = setting ? setting->rate : speakup_rate;
+    volume = setting ? setting->volume : speakup_volume;
+    speakup_rate = rate;
+    speakup_volume = volume;
+    if (choice == active_voice)
+        return;
+    snprintf(params, sizeof params, "voice=%s\nvop=%s\nrate=%d\nvolume=%d\n",
+             choice->name, choice->operating_point,
+             speakup_scale_rate(rate), speakup_scale_volume(volume));
     enqueue(ITEM_PARAMS, params, 0);
     active_voice = choice;
     fprintf(stderr, "Using voice %zu: %s (%s)\n",
@@ -275,7 +327,7 @@ static void select_voices(const struct filters *filters)
 }
 
 static void process_bytes(char *buf,ssize_t n)
-{ssize_t i=0,start=0;while(i<n){unsigned char c=buf[i];if(c==0x18){if(i>start){char save=buf[i];buf[i]=0;enqueue(ITEM_TEXT,buf+start,0);buf[i]=save;}clear_queue();i++;start=i;continue;}if(c==1){ssize_t j=i+1;int sign=0,value=0;if(i>start){char save=buf[i];buf[i]=0;enqueue(ITEM_TEXT,buf+start,0);buf[i]=save;}if(j<n&&(buf[j]=='+'||buf[j]=='-'))sign=buf[j++];while(j<n&&buf[j]>='0'&&buf[j]<='9')value=value*10+buf[j++]-'0';if(j>=n)break;switch(buf[j]){case'i':enqueue(ITEM_MARK,NULL,value);break;case's':{char p[64];snprintf(p,sizeof p,"rate=%d\n",speakup_scale_rate(value));enqueue(ITEM_PARAMS,p,0);break;}case'p':{char p[64];snprintf(p,sizeof p,"pitch=%d\n",speakup_scale_pitch(value));enqueue(ITEM_PARAMS,p,0);break;}case'v':{char p[64];snprintf(p,sizeof p,"volume=%d\n",speakup_scale_volume(value));enqueue(ITEM_PARAMS,p,0);break;}case'o':activate_voice(value);break;case'P':clear_queue();break;default:break;}(void)sign;i=j+1;start=i;continue;}i++;}if(i>start){char *text=strndup(buf+start,i-start);enqueue(ITEM_TEXT,text,0);free(text);}}
+{ssize_t i=0,start=0;while(i<n){unsigned char c=buf[i];if(c==0x18){if(i>start){char save=buf[i];buf[i]=0;enqueue(ITEM_TEXT,buf+start,0);buf[i]=save;}clear_queue();i++;start=i;continue;}if(c==1){ssize_t j=i+1;int sign=0,value=0;if(i>start){char save=buf[i];buf[i]=0;enqueue(ITEM_TEXT,buf+start,0);buf[i]=save;}if(j<n&&(buf[j]=='+'||buf[j]=='-'))sign=buf[j++];while(j<n&&buf[j]>='0'&&buf[j]<='9')value=value*10+buf[j++]-'0';if(j>=n)break;switch(buf[j]){case'i':enqueue(ITEM_MARK,NULL,value);break;case's':{char p[64];speakup_rate=value;if(active_voice)settings_update(active_voice->name,speakup_rate,speakup_volume);snprintf(p,sizeof p,"rate=%d\n",speakup_scale_rate(value));enqueue(ITEM_PARAMS,p,0);break;}case'p':{char p[64];snprintf(p,sizeof p,"pitch=%d\n",speakup_scale_pitch(value));enqueue(ITEM_PARAMS,p,0);break;}case'v':{char p[64];speakup_volume=value;if(active_voice)settings_update(active_voice->name,speakup_rate,speakup_volume);snprintf(p,sizeof p,"volume=%d\n",speakup_scale_volume(value));enqueue(ITEM_PARAMS,p,0);break;}case'o':activate_voice(value);break;case'P':clear_queue();break;default:break;}(void)sign;i=j+1;start=i;continue;}i++;}if(i>start){char *text=strndup(buf+start,i-start);enqueue(ITEM_TEXT,text,0);free(text);}}
 
 static int open_synth_device(const char *path)
 {
@@ -349,6 +401,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(stdout); return 0; }
         else { usage(stderr); return 2; }
     }
+    settings_path_init();
+    voice_settings_load(&voice_settings, settings_path);
     if (!foreground)
         daemonize();
     signal(SIGINT, on_signal);
@@ -399,6 +453,7 @@ int main(int argc, char **argv)
     pw_context_destroy(audio.context);
     pw_thread_loop_destroy(audio.loop);
     pw_deinit();
+    settings_flush();
     voice_list_destroy(&voices);
     return 0;
 }

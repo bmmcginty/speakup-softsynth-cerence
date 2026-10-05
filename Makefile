@@ -8,8 +8,8 @@ PIPEWIRE_LIBS := $(shell pkg-config --libs libpipewire-0.3)
 .PHONY: all clean test
 all: bin/speakup-cerence bin/speakup-cerence-voice-manager bin/wine-bridge-speakup-cerence.exe
 
-bin/speakup-cerence: src/speakup-cerence.c src/voice-list.c src/voice-list.h src/speakup-scale.c src/speakup-scale.h | bin
-	$(CC) $(CFLAGS) $(WARN) $(PIPEWIRE_CFLAGS) -Isrc -o $@ src/speakup-cerence.c src/voice-list.c src/speakup-scale.c $(PIPEWIRE_LIBS) -lpthread
+bin/speakup-cerence: src/speakup-cerence.c src/voice-list.c src/voice-list.h src/speakup-scale.c src/speakup-scale.h src/voice-settings.c src/voice-settings.h | bin
+	$(CC) $(CFLAGS) $(WARN) $(PIPEWIRE_CFLAGS) -Isrc -o $@ src/speakup-cerence.c src/voice-list.c src/speakup-scale.c src/voice-settings.c $(PIPEWIRE_LIBS) -lpthread
 
 bin/speakup-cerence-voice-manager: src/speakup-cerence-voice-manager.py | bin
 	cp $< $@
@@ -31,4 +31,7 @@ test: all
 	$(CC) $(CFLAGS) $(WARN) -Isrc -o /tmp/speakup-cerence-scale-test tests/speakup-scale.c src/speakup-scale.c
 	/tmp/speakup-cerence-scale-test
 	rm -f /tmp/speakup-cerence-scale-test
+	$(CC) $(CFLAGS) $(WARN) -Isrc -o /tmp/speakup-cerence-voice-settings-test tests/voice-settings.c src/voice-settings.c
+	/tmp/speakup-cerence-voice-settings-test
+	rm -f /tmp/speakup-cerence-voice-settings-test
 	./tests/cli.sh
