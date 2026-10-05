@@ -103,8 +103,10 @@ page. Selection is clamped at both ends: 0 returns to the startup voice on the
 first page, and unavailable positions on the final page select the last voice.
 This uses Speakup's existing 0–7 voice-control range without a kernel change.
 The installed voice list is read from the voice store on disk rather than
-from the engine, so the driver sees packages that the engine was not started
-with.
+from the engine. When a set-voice command finds that the store has changed,
+the driver restarts the resident Wine bridge so the engine picks up the new
+packages. A reload can also be requested at any time by sending `SIGHUP` to
+the driver, for example `pkill -HUP speakup-cerence`.
 
 Rate and volume are remembered per voice. Selecting a voice restores the last
 rate and volume used with it, and the table is saved beside the voice store so

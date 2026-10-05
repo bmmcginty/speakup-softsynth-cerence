@@ -43,8 +43,11 @@ static struct voice_settings voice_settings;
 static char settings_path[4096];
 static int settings_dirty;
 static unsigned store_fingerprint;
+static unsigned host_store_fingerprint;
+static volatile sig_atomic_t reload_requested;
 static int speakup_rate = 2;
 static int speakup_volume = 5;
+static int speakup_pitch = 5;
 
 static void die(const char *fmt, ...)
 {
@@ -182,6 +185,22 @@ static void spawn_host(void)
     close(a[0]);close(b[1]);host.in=a[1];host.out=b[0]; if(read_frame(&type,&payload,&n)||type!='R')die("Wine bridge did not become ready");free(payload);
 }
 
+/* Ask the bridge to quit and reap it.  The caller must already have stopped the
+ * worker, because closing the pipes while it is reading an utterance would
+ * lose frames. */
+static void stop_host(void)
+{
+    if (host.pid <= 0)
+        return;
+    send_frame(CMD_QUIT, "", 0);
+    close(host.in);
+    close(host.out);
+    host.in = -1;
+    host.out = -1;
+    waitpid(host.pid, NULL, 0);
+    host.pid = -1;
+}
+
 /* ------------------------------------------------------------- PipeWire */
 struct mark { uint64_t at; int value; struct mark *next; };
 struct audio_state { struct pw_thread_loop *loop; struct pw_context *context; struct pw_core *core; struct pw_stream *stream; struct spa_hook listener; pthread_mutex_t lock; pthread_cond_t space, drain_done; unsigned char data[AUDIO_CAP]; size_t rd, used; uint64_t written, played; struct mark *marks; bool drained; } audio = { .lock=PTHREAD_MUTEX_INITIALIZER, .space=PTHREAD_COND_INITIALIZER, .drain_done=PTHREAD_COND_INITIALIZER };
@@ -276,26 +295,31 @@ static int quality_rank(const char *quality)
            !strcmp(quality, "intermediate") ? 1 : 0;
 }
 
+static void send_voice_params(const struct voice_choice *choice)
+{
+    struct voice_setting *setting =
+        voice_settings_find(&voice_settings, choice->name);
+    char params[300];
+    int rate = setting ? setting->rate : speakup_rate;
+    int volume = setting ? setting->volume : speakup_volume;
+
+    speakup_rate = rate;
+    speakup_volume = volume;
+    snprintf(params, sizeof params,
+             "voice=%s\nvop=%s\nrate=%d\npitch=%d\nvolume=%d\n",
+             choice->name, choice->operating_point,
+             speakup_scale_rate(rate), speakup_scale_pitch(speakup_pitch),
+             speakup_scale_volume(volume));
+    enqueue(ITEM_PARAMS, params, 0);
+}
+
 static void activate_voice(int number)
 {
     const struct voice_choice *choice = voice_list_select(&voices, number);
-    struct voice_setting *setting;
-    char params[300];
-    int rate, volume;
 
-    if (!choice)
+    if (!choice || choice == active_voice)
         return;
-    setting = voice_settings_find(&voice_settings, choice->name);
-    rate = setting ? setting->rate : speakup_rate;
-    volume = setting ? setting->volume : speakup_volume;
-    speakup_rate = rate;
-    speakup_volume = volume;
-    if (choice == active_voice)
-        return;
-    snprintf(params, sizeof params, "voice=%s\nvop=%s\nrate=%d\nvolume=%d\n",
-             choice->name, choice->operating_point,
-             speakup_scale_rate(rate), speakup_scale_volume(volume));
-    enqueue(ITEM_PARAMS, params, 0);
+    send_voice_params(choice);
     active_voice = choice;
     fprintf(stderr, "Using voice %zu: %s (%s)\n",
             (size_t)(choice - voices.items) + 1, choice->name,
@@ -371,16 +395,33 @@ static void select_voices(void)
     activate_voice(1);
 }
 
+/* The engine reads the voice store when it starts, so a package installed
+ * later is not usable until the bridge is restarted.  Re-apply the active
+ * voice because the fresh bridge knows nothing about it. */
+static void restart_host(void)
+{
+    fprintf(stderr, "Reloading the Cerence bridge\n");
+    clear_queue();
+    wait_worker_idle();
+    stop_host();
+    spawn_host();
+    host_store_fingerprint = store_fingerprint;
+    if (active_voice)
+        send_voice_params(active_voice);
+}
+
 /* A set-voice command is also the signal that a new voice package may have
  * appeared, since the voice store is user data that can change while the
- * driver runs.  Cancel any speech in progress, re-read the list and then map
- * the requested number onto it. */
+ * driver runs.  Cancel any speech in progress, re-read the store and, if it
+ * changed, restart the engine before mapping the requested number. */
 static void change_voice(int number)
 {
     settings_flush();
     clear_queue();
     wait_worker_idle();
     fetch_voices();
+    if (store_fingerprint != host_store_fingerprint)
+        restart_host();
     if (!voices.count) {
         fprintf(stderr, "speakup-cerence: no installed voice matches the "
                 "requested filters\n");
@@ -390,7 +431,7 @@ static void change_voice(int number)
 }
 
 static void process_bytes(char *buf,ssize_t n)
-{ssize_t i=0,start=0;while(i<n){unsigned char c=buf[i];if(c==0x18){if(i>start){char save=buf[i];buf[i]=0;enqueue(ITEM_TEXT,buf+start,0);buf[i]=save;}clear_queue();i++;start=i;continue;}if(c==1){ssize_t j=i+1;int sign=0,value=0;if(i>start){char save=buf[i];buf[i]=0;enqueue(ITEM_TEXT,buf+start,0);buf[i]=save;}if(j<n&&(buf[j]=='+'||buf[j]=='-'))sign=buf[j++];while(j<n&&buf[j]>='0'&&buf[j]<='9')value=value*10+buf[j++]-'0';if(j>=n)break;switch(buf[j]){case'i':enqueue(ITEM_MARK,NULL,value);break;case's':{char p[64];speakup_rate=value;if(active_voice)settings_update(active_voice->name,speakup_rate,speakup_volume);snprintf(p,sizeof p,"rate=%d\n",speakup_scale_rate(value));enqueue(ITEM_PARAMS,p,0);break;}case'p':{char p[64];snprintf(p,sizeof p,"pitch=%d\n",speakup_scale_pitch(value));enqueue(ITEM_PARAMS,p,0);break;}case'v':{char p[64];speakup_volume=value;if(active_voice)settings_update(active_voice->name,speakup_rate,speakup_volume);snprintf(p,sizeof p,"volume=%d\n",speakup_scale_volume(value));enqueue(ITEM_PARAMS,p,0);break;}case'o':change_voice(value);break;case'P':clear_queue();break;default:break;}(void)sign;i=j+1;start=i;continue;}i++;}if(i>start){char *text=strndup(buf+start,i-start);enqueue(ITEM_TEXT,text,0);free(text);}}
+{ssize_t i=0,start=0;while(i<n){unsigned char c=buf[i];if(c==0x18){if(i>start){char save=buf[i];buf[i]=0;enqueue(ITEM_TEXT,buf+start,0);buf[i]=save;}clear_queue();i++;start=i;continue;}if(c==1){ssize_t j=i+1;int sign=0,value=0;if(i>start){char save=buf[i];buf[i]=0;enqueue(ITEM_TEXT,buf+start,0);buf[i]=save;}if(j<n&&(buf[j]=='+'||buf[j]=='-'))sign=buf[j++];while(j<n&&buf[j]>='0'&&buf[j]<='9')value=value*10+buf[j++]-'0';if(j>=n)break;switch(buf[j]){case'i':enqueue(ITEM_MARK,NULL,value);break;case's':{char p[64];speakup_rate=value;if(active_voice)settings_update(active_voice->name,speakup_rate,speakup_volume);snprintf(p,sizeof p,"rate=%d\n",speakup_scale_rate(value));enqueue(ITEM_PARAMS,p,0);break;}case'p':{char p[64];speakup_pitch=value;snprintf(p,sizeof p,"pitch=%d\n",speakup_scale_pitch(value));enqueue(ITEM_PARAMS,p,0);break;}case'v':{char p[64];speakup_volume=value;if(active_voice)settings_update(active_voice->name,speakup_rate,speakup_volume);snprintf(p,sizeof p,"volume=%d\n",speakup_scale_volume(value));enqueue(ITEM_PARAMS,p,0);break;}case'o':change_voice(value);break;case'P':clear_queue();break;default:break;}(void)sign;i=j+1;start=i;continue;}i++;}if(i>start){char *text=strndup(buf+start,i-start);enqueue(ITEM_TEXT,text,0);free(text);}}
 
 static int open_synth_device(const char *path)
 {
@@ -413,6 +454,7 @@ static int open_synth_device(const char *path)
 }
 
 static void on_signal(int sig){(void)sig;stopping=1;}
+static void on_sighup(int sig){(void)sig;reload_requested=1;}
 
 /* Detach from the controlling terminal so the driver can outlive the shell
  * that started it.  The parent returns immediately; the grandchild keeps the
@@ -469,11 +511,13 @@ int main(int argc, char **argv)
         daemonize();
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+    signal(SIGHUP, on_sighup);
     signal(SIGPIPE, SIG_IGN);
     spawn_host();
     audio_init(&argc, &argv);
     pthread_create(&thread, NULL, worker, NULL);
     select_voices();
+    host_store_fingerprint = store_fingerprint;
 
     synth_fd = open_synth_device(device);
     if (synth_fd < 0)
@@ -497,6 +541,10 @@ int main(int argc, char **argv)
         } else if (rc > 0 && (p.revents & (POLLERR | POLLHUP | POLLNVAL))) {
             break;
         }
+        if (reload_requested && !stopping) {
+            reload_requested = 0;
+            restart_host();
+        }
     }
 
     if (!stopping)
@@ -505,10 +553,7 @@ int main(int argc, char **argv)
     pthread_cond_broadcast(&queue_ready);
     clear_queue();
     pthread_join(thread, NULL);
-    send_frame(CMD_QUIT, "", 0);
-    close(host.in);
-    close(host.out);
-    waitpid(host.pid, NULL, 0);
+    stop_host();
     pw_thread_loop_stop(audio.loop);
     pw_stream_destroy(audio.stream);
     pw_core_disconnect(audio.core);
