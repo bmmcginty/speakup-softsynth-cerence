@@ -383,8 +383,6 @@ static void fetch_voices(void)
             }
         }
     }
-    if (!active_voice && voices.count)
-        active_voice = &voices.items[0];
 }
 
 static void select_voices(void)
