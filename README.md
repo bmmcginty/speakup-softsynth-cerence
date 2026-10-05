@@ -75,6 +75,10 @@ reader. The user running this program needs read/write access to
 bin/speakup-cerence --lang MNC --quality enhanced
 ```
 
+The driver detaches from the terminal and keeps running in the background. Add
+`--foreground` to keep it attached to the current terminal, for example while
+debugging or when a service manager supervises it.
+
 For end-to-end testing without a Speakup device, `--device` accepts a regular
 file or named pipe containing the same text and control-byte stream that
 `/dev/softsynthu` would provide. The process waits for queued speech and
@@ -82,10 +86,10 @@ PipeWire playback to drain after end-of-file.
 
 ```sh
 printf 'Testing Cerence speech.\n' > /tmp/softsynth-input
-bin/speakup-cerence --device /tmp/softsynth-input --lang ENU
+bin/speakup-cerence --foreground --device /tmp/softsynth-input --lang ENU
 
 mkfifo /tmp/softsynth-input.fifo
-bin/speakup-cerence --device /tmp/softsynth-input.fifo --lang ENU &
+bin/speakup-cerence --foreground --device /tmp/softsynth-input.fifo --lang ENU &
 printf 'Testing through a pipe.\n' > /tmp/softsynth-input.fifo
 ```
 

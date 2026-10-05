@@ -298,11 +298,44 @@ static int open_synth_device(const char *path)
 }
 
 static void on_signal(int sig){(void)sig;stopping=1;}
-static void usage(FILE*f){fprintf(f,"usage: speakup-cerence [--lang CODE] [--quality QUALITY] [--device PATH]\n");}
+
+/* Detach from the controlling terminal so the driver can outlive the shell
+ * that started it.  The parent returns immediately; the grandchild keeps the
+ * read side of the soft-synth device and the PipeWire stream open. */
+static void daemonize(void)
+{
+    pid_t pid;
+    int null_fd;
+
+    pid = fork();
+    if (pid < 0)
+        die("fork: %s", strerror(errno));
+    if (pid > 0)
+        _exit(0);
+    if (setsid() < 0)
+        die("setsid: %s", strerror(errno));
+    pid = fork();
+    if (pid < 0)
+        die("fork: %s", strerror(errno));
+    if (pid > 0)
+        _exit(0);
+
+    null_fd = open("/dev/null", O_RDWR);
+    if (null_fd >= 0) {
+        dup2(null_fd, STDIN_FILENO);
+        dup2(null_fd, STDOUT_FILENO);
+        dup2(null_fd, STDERR_FILENO);
+        if (null_fd > STDERR_FILENO)
+            close(null_fd);
+    }
+}
+
+static void usage(FILE*f){fprintf(f,"usage: speakup-cerence [--lang CODE] [--quality QUALITY] [--device PATH] [--foreground]\n");}
 int main(int argc, char **argv)
 {
     struct filters f = {0};
     const char *device = NULL;
+    int foreground = 0;
     int i;
     pthread_t thread;
 
@@ -312,9 +345,12 @@ int main(int argc, char **argv)
         if (!strcmp(argv[i], "--lang") && i + 1 < argc) f.lang = argv[++i];
         else if (!strcmp(argv[i], "--quality") && i + 1 < argc) f.quality = argv[++i];
         else if (!strcmp(argv[i], "--device") && i + 1 < argc) device = argv[++i];
+        else if (!strcmp(argv[i], "--foreground")) foreground = 1;
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(stdout); return 0; }
         else { usage(stderr); return 2; }
     }
+    if (!foreground)
+        daemonize();
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN);
