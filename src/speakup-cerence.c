@@ -21,18 +21,16 @@
 #include "speakup-scale.h"
 #include "voice-list.h"
 #include "voice-settings.h"
+#include "voice-store.h"
 
 #define RATE 22050
 #define AUDIO_CAP (RATE * 2 * 30)
 #define FRAME_AUDIO 'A'
 #define FRAME_MARK 'M'
 #define FRAME_DONE 'D'
-#define FRAME_VOICE 'V'
-#define FRAME_LIST 'L'
 #define FRAME_ERROR 'E'
 #define CMD_SPEAK 'S'
 #define CMD_PARAMS 'P'
-#define CMD_LIST 'L'
 #define CMD_CANCEL 'C'
 #define CMD_QUIT 'Q'
 
@@ -44,6 +42,7 @@ static const struct voice_choice *active_voice;
 static struct voice_settings voice_settings;
 static char settings_path[4096];
 static int settings_dirty;
+static unsigned store_fingerprint;
 static int speakup_rate = 2;
 static int speakup_volume = 5;
 
@@ -306,13 +305,12 @@ static void activate_voice(int number)
 static void fetch_voices(void)
 {
     struct voice_list fresh = {0};
+    struct installed_voices installed = {0};
     char keep_name[VOICE_FIELD_SIZE] = "";
     char keep_operating_point[VOICE_FIELD_SIZE] = "";
+    char store[4096];
     size_t page_start = voices.page_start;
-    char type, *payload;
-    uint32_t length;
     size_t i;
-    int complete = 0;
 
     /* Sorting reorders the array, so remember the active voice by value and
      * re-resolve it after the rebuild. */
@@ -322,40 +320,26 @@ static void fetch_voices(void)
                  active_voice->operating_point);
     }
 
-    send_frame(CMD_LIST, "", 0);
-    while (!read_frame(&type, &payload, &length)) {
-        if (type == FRAME_LIST) {
-            complete = 1;
-            free(payload);
-            break;
+    voice_store_path(store, sizeof store);
+    if (voice_store_scan(&installed, store) < 0)
+        die("out of memory");
+    store_fingerprint = installed.fingerprint;
+    for (i = 0; i < installed.count; i++) {
+        const char *quality = quality_name(installed.items[i].operating_point);
+        if ((!filters.lang ||
+             !strcasecmp(installed.items[i].language, filters.lang)) &&
+            (!filters.quality ||
+             !strcasecmp(quality, quality_name(filters.quality))) &&
+            voice_list_add(&fresh, installed.items[i].language,
+                           installed.items[i].name,
+                           installed.items[i].operating_point,
+                           quality_rank(quality)) < 0) {
+            voice_store_destroy(&installed);
+            voice_list_destroy(&fresh);
+            die("out of memory");
         }
-        if (type == FRAME_VOICE) {
-            char *name = strchr(payload, '\t');
-            char *operating_point = name ? strchr(name + 1, '\t') : NULL;
-            if (name && operating_point) {
-                const char *quality;
-                *name++ = '\0';
-                *operating_point++ = '\0';
-                quality = quality_name(operating_point);
-                if ((!filters.lang ||
-                     !strcasecmp(payload, filters.lang)) &&
-                    (!filters.quality ||
-                     !strcasecmp(quality, quality_name(filters.quality))) &&
-                    voice_list_add(&fresh, payload, name, operating_point,
-                                   quality_rank(quality)) < 0) {
-                    free(payload);
-                    voice_list_destroy(&fresh);
-                    die("out of memory");
-                }
-            }
-        }
-        free(payload);
     }
-    if (!complete) {
-        /* The engine did not answer; keep the voices we already have. */
-        voice_list_destroy(&fresh);
-        return;
-    }
+    voice_store_destroy(&installed);
 
     voice_list_sort(&fresh);
     fresh.page_start = page_start;
