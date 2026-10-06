@@ -122,8 +122,12 @@ when they are first selected.
 
 Speakup's flush, index, rate, pitch, volume, and pause commands are also handled
 directly. Indexes are written back when PipeWire reaches their audio position.
-Speakup sends rate, pitch and volume as 0–9 digits; the driver maps them onto
-the engine's rate (50–400), pitch (50–200) and volume (0–100) ranges.
+Speakup sends rate, pitch and volume as 0–9 digits. The engine's rate and
+pitch are percentages relative to each voice's neutral value of 100, so the
+driver anchors Speakup's default rate (2) and pitch (5) at that neutral value
+and moves a fixed step per digit; volume is spread across the engine's 0–100
+range. Anchoring the defaults prevents the fast, chipmunk-like speech that an
+even spread across the engine's full 50–400 and 50–200 ranges produced.
 
 The Cerence engine cannot be opened safely by two Wine bridge processes at
 once. A second bridge now exits immediately with an "engine is already in use"
