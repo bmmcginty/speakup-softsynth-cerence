@@ -14,14 +14,20 @@
  * Speakup default and move a fixed number of percentage points per step
  * instead.  The engine's extremes remain available to callers that set the
  * parameters directly, but they are deliberately not reachable from a single
- * Speakup digit. */
+ * Speakup digit.
+ *
+ * Speakup volume 0 maps to engine silence if it is scaled from zero.  espeakup,
+ * which this driver replaces, deliberately never passes 0 to espeak: it uses
+ * (volume + 1) * 22 on espeak's 0-200 scale.  Mirror that on the engine's
+ * 0-100 scale as (digit + 1) * 11, so the bottom digit stays audible and the
+ * default digit 5 still gives about two thirds of full volume. */
 #define ENGINE_NEUTRAL 100
 #define RATE_DEFAULT_DIGIT 2
 #define RATE_STEP 25
 #define PITCH_DEFAULT_DIGIT 5
 #define PITCH_STEP 10
-#define VOLUME_LOW 0
-#define VOLUME_HIGH 100
+#define VOLUME_STEP 11
+#define VOLUME_MAX 100
 
 static int clamp_digit(int digit)
 {
@@ -30,14 +36,6 @@ static int clamp_digit(int digit)
     if (digit > 9)
         return 9;
     return digit;
-}
-
-static int scale_digit(int digit, int low, int high)
-{
-    digit = clamp_digit(digit);
-    /* Round to nearest so the nine steps divide the span as evenly as the
-     * integer engine parameters allow. */
-    return low + (digit * (high - low) + 4) / 9;
 }
 
 int speakup_scale_rate(int digit)
@@ -54,5 +52,9 @@ int speakup_scale_pitch(int digit)
 
 int speakup_scale_volume(int digit)
 {
-    return scale_digit(digit, VOLUME_LOW, VOLUME_HIGH);
+    int volume = (clamp_digit(digit) + 1) * VOLUME_STEP;
+
+    if (volume > VOLUME_MAX)
+        volume = VOLUME_MAX;
+    return volume;
 }

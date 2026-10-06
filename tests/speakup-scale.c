@@ -17,7 +17,9 @@ int main(void)
     assert(speakup_scale_rate(9) == 275);
     assert(speakup_scale_pitch(0) == 50);
     assert(speakup_scale_pitch(9) == 140);
-    assert(speakup_scale_volume(0) == 0);
+    /* Volume 0 is quiet, not silent, and follows espeakup's scale. */
+    assert(speakup_scale_volume(0) == 11);
+    assert(speakup_scale_volume(5) == 66);
     assert(speakup_scale_volume(9) == 100);
 
     /* Values stay inside the engine's range and never move backwards. */
@@ -38,7 +40,7 @@ int main(void)
     previous = speakup_scale_volume(0);
     for (digit = 1; digit <= 9; digit++) {
         int value = speakup_scale_volume(digit);
-        assert(value >= 0 && value <= 100);
+        assert(value >= 11 && value <= 100);
         assert(value >= previous);
         previous = value;
     }
@@ -46,7 +48,7 @@ int main(void)
     /* Out-of-range digits are clamped rather than passed through. */
     assert(speakup_scale_pitch(-3) == 50);
     assert(speakup_scale_pitch(42) == 140);
-    assert(speakup_scale_volume(-3) == 0);
+    assert(speakup_scale_volume(-3) == 11);
     assert(speakup_scale_volume(42) == 100);
     return 0;
 }
