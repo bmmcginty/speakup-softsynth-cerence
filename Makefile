@@ -5,7 +5,7 @@ WARN = -Wall -Wextra
 PIPEWIRE_CFLAGS := $(shell pkg-config --cflags libpipewire-0.3)
 PIPEWIRE_LIBS := $(shell pkg-config --libs libpipewire-0.3)
 
-.PHONY: all clean test
+.PHONY: all clean test test-installed-voices
 all: bin/speakup-cerence bin/speakup-cerence-voice-manager bin/wine-bridge-speakup-cerence.exe
 
 bin/speakup-cerence: src/speakup-cerence.c src/voice-list.c src/voice-list.h src/speakup-scale.c src/speakup-scale.h src/voice-settings.c src/voice-settings.h src/voice-store.c src/voice-store.h | bin
@@ -38,3 +38,6 @@ test: all
 	/tmp/speakup-cerence-voice-store-test
 	rm -f /tmp/speakup-cerence-voice-store-test
 	./tests/cli.sh
+
+test-installed-voices: all
+	./tests/installed-voices.sh

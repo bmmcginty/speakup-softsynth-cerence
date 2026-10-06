@@ -148,3 +148,28 @@ make test
 
 The test is offline and checks voice filtering, including the distinction
 between a missing filter value and an empty intersection.
+
+A separate live test exercises the licensed engine and every installed
+voice/operating-point pair. It produces WAV files for four profiles using the
+Speakup settings supported by this driver:
+
+- `lowest`: rate 0, pitch 0, volume 0;
+- `middle`: rate 5, pitch 5, volume 5;
+- `default`: Speakup's actual defaults, rate 2, pitch 5, volume 5;
+- `highest`: rate 9, pitch 9, volume 9.
+
+The test verifies the scaled engine parameters, WAV format, non-empty frame
+count, and non-silent audio. It leaves the samples and a tab-separated manifest
+in `test-output/installed-voices` for listening and comparison.
+
+```sh
+make test-installed-voices
+
+# Optional locations and Wine executable:
+VOICE_TEST_OUTPUT=/tmp/cerence-voice-tests \
+SPEAKUP_CERENCE_VOICE_STORE=/path/to/voices \
+WINE=/path/to/wine make test-installed-voices
+```
+
+This live test is intentionally not part of `make test`: it requires the
+Cerence DLLs, a valid engine licence, Wine, and at least one installed voice.
