@@ -150,13 +150,18 @@ The test is offline and checks voice filtering, including the distinction
 between a missing filter value and an empty intersection.
 
 A separate live test exercises the licensed engine and every installed
-voice/operating-point pair. It produces WAV files for four profiles using the
-Speakup settings supported by this driver:
+voice/operating-point pair. It tests each adjustable Speakup setting supported
+by this driver—rate, pitch, and volume—independently at its lowest (0), middle
+(5), default, and highest (9) values. The other two settings remain at
+Speakup's defaults while one is varied: rate defaults to 2, while pitch and
+volume default to 5. Consequently, the middle and default samples for pitch
+and volume intentionally use the same values.
 
-- `lowest`: rate 0, pitch 0, volume 0;
-- `middle`: rate 5, pitch 5, volume 5;
-- `default`: Speakup's actual defaults, rate 2, pitch 5, volume 5;
-- `highest`: rate 9, pitch 9, volume 9.
+Voice selection is the outer dimension of the matrix, so all twelve setting
+cases are synthesized for every installed voice and operating point. Index,
+flush, and pause are event commands rather than scalar settings. Other
+soft-synth variables are not mapped to Cerence by this driver and cannot be
+included as adjustable cases until they are supported.
 
 The test verifies the scaled engine parameters, WAV format, non-empty frame
 count, and non-silent audio. It leaves the samples and a tab-separated manifest
