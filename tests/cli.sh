@@ -10,6 +10,21 @@ test -x "$root/bin/speakup-cerence-voice-manager"
 "$root/bin/speakup-cerence" --help | grep -q -- '--device PATH'
 "$root/bin/speakup-cerence" --help | grep -q -- '--foreground'
 "$root/bin/speakup-cerence" --help | grep -q -- '--log FILE'
+"$root/bin/speakup-cerence" --help | grep -q -- '--debug LEVEL'
+"$root/bin/speakup-cerence" --help | grep -q -- '--debug-file PATH'
+
+if "$root/bin/speakup-cerence" --debug 0 >/dev/null 2>&1; then
+    echo "--debug accepted level 0" >&2
+    exit 1
+fi
+if "$root/bin/speakup-cerence" --debug 4 >/dev/null 2>&1; then
+    echo "--debug accepted level 4" >&2
+    exit 1
+fi
+if "$root/bin/speakup-cerence" --debug invalid >/dev/null 2>&1; then
+    echo "--debug accepted a non-numeric level" >&2
+    exit 1
+fi
 cat >"$work/voices.json" <<'JSON'
 [
  {"voice_name":"Alpha","lang_code":"AAA","language":"A","gender":"Female","voice_type":"embedded-compact","quality":"Lowest","package_name":"a.zip","package_hash":"0000000000000000000000000000000000000000","size_in_bytes":10,"download_url":"https://example.invalid/a.zip"},

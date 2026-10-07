@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <wchar.h>
 #include <io.h>
 #include <fcntl.h>
@@ -43,6 +44,7 @@ enum {
     PARAM_MARKER_MODE = 19,
     PARAM_INITMODE = 20,
     PARAM_DISABLE_FINAL_SILENCE = 22,
+    PARAM_TIMBRE = 24,
 };
 
 #define VE_INITMODE_LOAD_ONCE_OPEN_ALL 0xC
@@ -204,6 +206,22 @@ static unsigned (*ve_stop)(VE_HSAFE);
 static const char *(*ve_getLastErrorMessage)(void);
 static unsigned (*ve_getProductVersion)(void *);
 static unsigned (*ve_getAdditionalProductInfo)(void *);
+
+static int g_debug_level;
+
+static void debug_log(int level, const char *fmt, ...)
+{
+    va_list ap;
+
+    if (g_debug_level < level)
+        return;
+    fprintf(stderr, "bridge-debug%d: ", level);
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+    fflush(stderr);
+}
 
 static const char *errText(unsigned code, char *buf, size_t len)
 {
@@ -441,6 +459,7 @@ static int load_engine(const wchar_t *libdir, const char *libdir_display,
         fprintf(stderr, "engine DLL is missing required exports\n");
         return -1;
     }
+    debug_log(1, "loaded license manager and runatts_%s.dll", addon_name);
     return 0;
 }
 
@@ -542,6 +561,12 @@ static int lock_engine(void)
 
 static int engine_open_data(const wchar_t **dirs, size_t ndirs)
 {
+    size_t i;
+
+    debug_log(1, "initializing engine with %llu data directories",
+              (unsigned long long)ndirs);
+    for (i = 0; i < ndirs; i++)
+        debug_log(2, "data[%llu]=%ls", (unsigned long long)i, dirs[i]);
     memset(&g_install, 0, sizeof g_install);
     g_install.fmtVersion = VE_CURRENT_VERSION;
     memset(&g_platform, 0, sizeof g_platform);
@@ -554,6 +579,7 @@ static int engine_open_data(const wchar_t **dirs, size_t ndirs)
     CHECK(ve_getInterfaces(&g_install, &g_platform), "getInterfaces");
     memset(&g_speech, 0, sizeof g_speech);
     CHECK(ve_initialize(&g_install, &g_speech), "initialize");
+    debug_log(1, "engine initialized");
     return 0;
 }
 
@@ -840,13 +866,13 @@ static int cmd_speak(const struct speak_opts *o)
     param_int(&query[n++], PARAM_VOLUME, 0);
     param_int(&query[n++], PARAM_WAITFACTOR, 0);
     param_int(&query[n++], PARAM_FREQUENCY, 0);
-    if (ve_getParamList(instance, query, (uint16_t)n) == NUAN_OK) {
-        if (getenv("SPEAKUP_CERENCE_DEBUG"))
-            fprintf(stderr, "params rate=%u pitch=%u volume=%u waitfactor=%u freq=%u\n",
-                    query[0].uValue.usValue, query[1].uValue.usValue,
-                    query[2].uValue.usValue, query[3].uValue.usValue,
-                    query[4].uValue.usValue);
-    }
+    param_int(&query[n++], PARAM_TIMBRE, 0);
+    if (ve_getParamList(instance, query, (uint16_t)n) == NUAN_OK)
+        debug_log(1, "effective params rate=%u pitch=%u volume=%u "
+                  "waitfactor=%u frequency=%u timbre=%u",
+                  query[0].uValue.usValue, query[1].uValue.usValue,
+                  query[2].uValue.usValue, query[3].uValue.usValue,
+                  query[4].uValue.usValue, query[5].uValue.usValue);
 
     memset(&in_text, 0, sizeof in_text);
     in_text.eTextFormat = 0;
@@ -918,6 +944,7 @@ static void usage(void)
         "  --char-mode                 read the input one character at a time\n"
         "  --timeout-ms N              synthesis timeout, default 60000\n"
         "  --addon-name NAME           engine DLL base name\n"
+        "  --debug LEVEL               diagnostics level, 1 through 3\n"
         "\n"
         "All paths may be Unix paths; Wine exposes them through its Z: drive.\n");
 }
@@ -979,6 +1006,17 @@ int wmain(int argc, wchar_t **wargv)
         else if (!strcmp(a, "--volume")) { NEED(); opts.volume = atoi(next); opts.have_volume = 1; }
         else if (!strcmp(a, "--waitfactor")) { NEED(); opts.waitfactor = atoi(next); opts.have_waitfactor = 1; }
         else if (!strcmp(a, "--timeout-ms")) { NEED(); opts.timeout_ms = atoi(next); }
+        else if (!strcmp(a, "--debug")) {
+            char *end;
+            long level;
+            NEED();
+            level = strtol(next, &end, 10);
+            if (*end || level < 1 || level > 3) {
+                fprintf(stderr, "--debug level must be 1, 2, or 3\n");
+                return 2;
+            }
+            g_debug_level = (int)level;
+        }
         else if (!strcmp(a, "--char-mode")) { opts.char_mode = 1; take = 0; }
         else if (!strcmp(a, "--list-languages")) { command = "languages"; take = 0; }
         else if (!strcmp(a, "--list-voices")) { NEED(); command = "voices"; cmd_arg = (char *)next; }
@@ -1072,6 +1110,9 @@ int wmain(int argc, wchar_t **wargv)
         free(display);
     }
 
+    debug_log(1, "command=%s lib=%ls data=%ls voices=%ls",
+              command ? command : "none", libdir, data_dir,
+              store ? store : L"(none)");
     if (!addon_name) {
         addon_name = discover_addon_name(libdir);
         if (!addon_name) {
@@ -1105,6 +1146,7 @@ int wmain(int argc, wchar_t **wargv)
     if (store)
         dirs[ndirs++] = store;
 
+    debug_log(1, "using engine add-on %s", addon_name);
     if (lock_engine() < 0)
         return 1;
     if (engine_open_data(dirs, ndirs) < 0)

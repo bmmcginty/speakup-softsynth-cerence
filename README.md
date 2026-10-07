@@ -88,6 +88,31 @@ appends diagnostics to
 standard error only. `--foreground` writes to the log and to the terminal.
 Wine bridge errors are captured in the same log.
 
+Use `--debug LEVEL` for additional Linux, bridge, and Wine diagnostics. Levels
+1 through 3 are supported, and higher levels include everything below them:
+
+- Level 1 records startup, resolved components, voice selection, requested
+  parameters, and the effective parameters read back from Cerence. Wine's own
+  debug channels remain disabled.
+- Level 2 adds synthesis timing, audio and marker totals, data paths, DLL-load
+  messages, and structured-exception diagnostics from Wine.
+- Level 3 records every bridge command, engine callback, and marker, and also
+  enables Wine warnings. It can produce a large log and is intended for short
+  reproductions of text-processing and prosody problems.
+
+`--debug-file PATH` sends the combined driver, bridge, and Wine diagnostics to
+that path, taking precedence over `--log` and `SPEAKUP_CERENCE_LOG`. For
+example:
+
+```sh
+printf 'A sentence with falling intonation.\n' > /tmp/softsynth-input
+bin/speakup-cerence --debug 3 --debug-file /tmp/cerence-debug.log \
+    --foreground --device /tmp/softsynth-input --lang ENU
+```
+
+Debug logs include installation paths, voice names, parameter values, and text
+lengths, but do not include synthesized text or licence keys.
+
 For end-to-end testing without a Speakup device, `--device` accepts a regular
 file or named pipe containing the same text and control-byte stream that
 `/dev/softsynthu` would provide. The process waits for queued speech and

@@ -52,6 +52,7 @@ static int speakup_pitch = 5;
 static int log_fd = -1;
 static FILE *log_file;
 static int log_console;
+static int debug_level;
 
 /* --------------------------------------------------------------- logging */
 
@@ -76,6 +77,25 @@ static void log_msg(const char *fmt, ...)
 {
     va_list ap;
 
+    if (log_file) {
+        char stamp[32];
+        time_t now = time(NULL);
+        struct tm broken_down;
+        localtime_r(&now, &broken_down);
+        strftime(stamp, sizeof stamp, "%Y-%m-%dT%H:%M:%S ", &broken_down);
+        fputs(stamp, log_file);
+    }
+    va_start(ap, fmt);
+    log_vmsg(fmt, ap);
+    va_end(ap);
+}
+
+static void debug_msg(int level, const char *fmt, ...)
+{
+    va_list ap;
+
+    if (debug_level < level)
+        return;
     if (log_file) {
         char stamp[32];
         time_t now = time(NULL);
@@ -258,20 +278,54 @@ static int read_frame(char *type, char **data, uint32_t *n) { unsigned char h[5]
 
 static void spawn_host(void)
 {
-    int a[2],b[2]; char exe[4096],lib[4096],data[4096],store[4096]; const char *wine=getenv("WINE"); char type,*payload;uint32_t n;
+    int a[2], b[2];
+    char exe[4096], lib[4096], data[4096], store[4096], level[8];
+    const char *wine = getenv("WINE");
+    const char *wine_debug = "-all";
+    char type, *payload;
+    uint32_t n;
+
     if (!wine || !*wine)
         wine = "wine";
+    if (debug_level == 2)
+        wine_debug = "-all,+seh,+loaddll";
+    else if (debug_level >= 3)
+        wine_debug = "warn+all,+seh,+loaddll";
     root_path("SPEAKUP_CERENCE_BRIDGE", "bin/wine-bridge-speakup-cerence.exe", exe, sizeof exe);
     root_path("SPEAKUP_CERENCE_LIB", "lib", lib, sizeof lib);
     root_path("SPEAKUP_CERENCE_DATA", "lib/data", data, sizeof data);
     voice_store_path(store, sizeof store);
+    snprintf(level, sizeof level, "%d", debug_level);
+    debug_msg(1, "debug: bridge=%s wine=%s WINEDEBUG=%s\n",
+              exe, wine, wine_debug);
+    debug_msg(2, "debug: library=%s data=%s voices=%s\n", lib, data, store);
     if (pipe(a) || pipe(b))
         die("pipe: %s", strerror(errno));
     host.pid = fork();
     if (host.pid < 0)
         die("fork: %s", strerror(errno));
-    if(!host.pid){if(log_fd>=0)dup2(log_fd,2);dup2(a[0],0);dup2(b[1],1);close(a[0]);close(a[1]);close(b[0]);close(b[1]);setenv("WINEDEBUG","-all",0);execlp(wine,wine,exe,"--lib-dir",lib,"--data-dir",data,"--store",store,"--serve",NULL);_exit(127);}
-    close(a[0]);close(b[1]);host.in=a[1];host.out=b[0]; if(read_frame(&type,&payload,&n)||type!='R')die("Wine bridge did not become ready");free(payload);
+    if (!host.pid) {
+        if (log_fd >= 0)
+            dup2(log_fd, STDERR_FILENO);
+        dup2(a[0], STDIN_FILENO);
+        dup2(b[1], STDOUT_FILENO);
+        close(a[0]); close(a[1]); close(b[0]); close(b[1]);
+        setenv("WINEDEBUG", wine_debug, debug_level ? 1 : 0);
+        if (debug_level)
+            execlp(wine, wine, exe, "--debug", level, "--lib-dir", lib,
+                   "--data-dir", data, "--store", store, "--serve", NULL);
+        else
+            execlp(wine, wine, exe, "--lib-dir", lib, "--data-dir", data,
+                   "--store", store, "--serve", NULL);
+        _exit(127);
+    }
+    close(a[0]);
+    close(b[1]);
+    host.in = a[1];
+    host.out = b[0];
+    if (read_frame(&type, &payload, &n) || type != 'R')
+        die("Wine bridge did not become ready");
+    free(payload);
     log_msg("Cerence bridge ready\n");
 }
 
@@ -575,11 +629,17 @@ static void daemonize(void)
     }
 }
 
-static void usage(FILE*f){fprintf(f,"usage: speakup-cerence [--lang CODE] [--quality QUALITY] [--device PATH] [--log FILE] [--foreground]\n");}
+static void usage(FILE *f)
+{
+    fprintf(f, "usage: speakup-cerence [--lang CODE] [--quality QUALITY] "
+            "[--device PATH] [--log FILE] [--debug LEVEL] "
+            "[--debug-file PATH] [--foreground]\n");
+}
 int main(int argc, char **argv)
 {
     const char *device = NULL;
     const char *log_path = NULL;
+    const char *debug_path = NULL;
     char default_log[4096];
     int foreground = 0;
     int i;
@@ -592,10 +652,22 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--quality") && i + 1 < argc) filters.quality = argv[++i];
         else if (!strcmp(argv[i], "--device") && i + 1 < argc) device = argv[++i];
         else if (!strcmp(argv[i], "--log") && i + 1 < argc) log_path = argv[++i];
+        else if (!strcmp(argv[i], "--debug") && i + 1 < argc) {
+            char *end;
+            long value = strtol(argv[++i], &end, 10);
+            if (*end || value < 1 || value > 3) {
+                fprintf(stderr, "--debug level must be 1, 2, or 3\n");
+                return 2;
+            }
+            debug_level = (int)value;
+        }
+        else if (!strcmp(argv[i], "--debug-file") && i + 1 < argc) debug_path = argv[++i];
         else if (!strcmp(argv[i], "--foreground")) foreground = 1;
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(stdout); return 0; }
         else { usage(stderr); return 2; }
     }
+    if (debug_path)
+        log_path = debug_path;
     if (!log_path)
         log_path = getenv("SPEAKUP_CERENCE_LOG");
     if (log_path && !*log_path)
@@ -603,8 +675,15 @@ int main(int argc, char **argv)
     if (!log_path)
         log_path = log_default_path(default_log, sizeof default_log);
     log_open(log_path, foreground);
+    if (debug_path && strcmp(debug_path, "-") && log_fd < 0) {
+        fprintf(stderr, "cannot open debug file %s: %s\n", debug_path,
+                strerror(errno));
+        return 1;
+    }
     log_msg("speakup-cerence starting (log %s)\n",
             log_path ? log_path : "standard error");
+    debug_msg(1, "debug: level=%d pid=%ld foreground=%d\n",
+              debug_level, (long)getpid(), foreground);
     settings_path_init();
     voice_settings_load(&voice_settings, settings_path);
     if (!foreground)

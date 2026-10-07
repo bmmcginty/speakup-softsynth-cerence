@@ -94,7 +94,7 @@ while IFS=$'\t' read -r language_code language voice operating_point; do
         # duration comparisons isolate the parameter being varied.
         text="This is a Speakup settings test for $voice."
 
-        if ! SPEAKUP_CERENCE_DEBUG=1 WINEDEBUG=-all "$wine" "$bridge" \
+        if ! WINEDEBUG=-all "$wine" "$bridge" --debug 1 \
                 --lib-dir "$lib" --data-dir "$data" --store "$store" \
                 --voice "$voice" --vop "$operating_point" \
                 --language "$language" --rate "$engine_rate" \

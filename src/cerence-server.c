@@ -75,6 +75,12 @@ struct serve_state {
     int instance_open;
     char open_voice[VE_MAX_STRING_LENGTH];
     char open_vop[VE_MAX_STRING_LENGTH];
+
+    unsigned utterance;
+    unsigned callbacks;
+    unsigned markers;
+    unsigned long long audio_bytes;
+    ULONGLONG synth_started;
 };
 
 static struct serve_state g_serve;
@@ -135,6 +141,9 @@ static uint32_t serve_on_audio(VE_HSAFE instance, void *userData, VE_CALLBACKMSG
 
     if (!msg)
         return NUAN_OK;
+    g_serve.callbacks++;
+    debug_log(3, "callback message=0x%08x value=%d", msg->eMessage,
+              msg->lValue);
     if (msg->eMessage == VE_MSG_OUTBUFREQ) {
         out = (VE_OUTDATA *)msg->pParam;
         out->pOutPcmBuf = g_serve_pcm;
@@ -150,6 +159,10 @@ static uint32_t serve_on_audio(VE_HSAFE instance, void *userData, VE_CALLBACKMSG
         return NUAN_E_TTS_USERSTOP;
 
     out = (VE_OUTDATA *)msg->pParam;
+    g_serve.audio_bytes += out->cntPcmBufLen;
+    debug_log(3, "audio bytes=%llu markers=%llu",
+              (unsigned long long)out->cntPcmBufLen,
+              (unsigned long long)out->cntMrkListLen);
     if (out->cntPcmBufLen) {
         if (frame_write(SERVE_FRAME_AUDIO, out->pOutPcmBuf,
                         (uint32_t)out->cntPcmBufLen) != 0)
@@ -159,6 +172,14 @@ static uint32_t serve_on_audio(VE_HSAFE instance, void *userData, VE_CALLBACKMSG
      * which is the opposite of how the list length was requested. */
     for (i = 0; i < out->cntMrkListLen && i < SERVE_MARK_BUF; i++) {
         VE_MARKINFO *mark = &out->pMrkList[i];
+        g_serve.markers++;
+        debug_log(3, "marker[%llu] type=%u src=%llu+%llu dest=%llu+%u "
+                  "us=%u ul=%u",
+                  (unsigned long long)i, mark->eMrkType,
+                  (unsigned long long)mark->cntSrcPos,
+                  (unsigned long long)mark->cntSrcTextLen,
+                  (unsigned long long)mark->cntDestPos, mark->cntDestLen,
+                  mark->usValue, mark->ulValue);
         if (mark->eMrkType != VE_MRK_BOOKMARK || !mark->szValue)
             continue;
         if (frame_write(SERVE_FRAME_MARK, mark->szValue,
@@ -173,20 +194,29 @@ static uint32_t serve_on_audio(VE_HSAFE instance, void *userData, VE_CALLBACKMSG
 static void serve_apply_params(void)
 {
     VE_PARAM params[10];
+    VE_PARAM query[6];
     VE_OUTDEVINFO dev;
+    unsigned rc;
     int n = 0;
 
     if (g_serve.instance_open &&
         (strcmp(g_serve.open_voice, g_serve.voice) ||
          strcmp(g_serve.open_vop, g_serve.vop))) {
+        debug_log(1, "closing voice=%s vop=%s", g_serve.open_voice,
+                  g_serve.open_vop);
         ve_close(g_serve.instance);
         g_serve.instance_open = 0;
     }
 
     if (!g_serve.instance_open) {
-        if (ve_open(g_speech, g_install.hHeap, g_install.hLog,
-                    &g_serve.instance) != NUAN_OK) {
-            frame_error("engine open failed");
+        debug_log(1, "opening voice=%s vop=%s", g_serve.voice, g_serve.vop);
+        rc = ve_open(g_speech, g_install.hHeap, g_install.hLog,
+                     &g_serve.instance);
+        if (rc != NUAN_OK) {
+            char buffer[256];
+            frame_error(errText(rc, buffer, sizeof buffer));
+            debug_log(1, "engine open failed: %s",
+                      errText(rc, buffer, sizeof buffer));
             return;
         }
         g_serve.instance_open = 1;
@@ -203,13 +233,23 @@ static void serve_apply_params(void)
         param_int(&params[n++], PARAM_READMODE, READMODE_SENT);
         param_int(&params[n++], PARAM_FREQUENCY, 22);
         param_int(&params[n++], PARAM_DISABLE_FINAL_SILENCE, 0);
-        if (ve_setParamList(g_serve.instance, params, (uint16_t)n) != NUAN_OK)
-            frame_error("engine voice setup failed");
+        rc = ve_setParamList(g_serve.instance, params, (uint16_t)n);
+        if (rc != NUAN_OK) {
+            char buffer[256];
+            frame_error(errText(rc, buffer, sizeof buffer));
+            debug_log(1, "engine voice setup failed: %s",
+                      errText(rc, buffer, sizeof buffer));
+        }
 
         memset(&dev, 0, sizeof dev);
         dev.pfOutNotify = serve_on_audio;
-        if (ve_setCallback(g_serve.instance, &dev) != NUAN_OK)
-            frame_error("engine callback setup failed");
+        rc = ve_setCallback(g_serve.instance, &dev);
+        if (rc != NUAN_OK) {
+            char buffer[256];
+            frame_error(errText(rc, buffer, sizeof buffer));
+            debug_log(1, "engine callback setup failed: %s",
+                      errText(rc, buffer, sizeof buffer));
+        }
     }
 
     n = 0;
@@ -221,8 +261,42 @@ static void serve_apply_params(void)
         param_int(&params[n++], PARAM_VOLUME, g_serve.volume);
     if (g_serve.have_waitfactor)
         param_int(&params[n++], PARAM_WAITFACTOR, g_serve.waitfactor);
-    if (n && ve_setParamList(g_serve.instance, params, (uint16_t)n) != NUAN_OK)
-        frame_error("engine parameter setup failed");
+    debug_log(1, "requested params rate=%s%d pitch=%s%d volume=%s%d "
+              "waitfactor=%s%d", g_serve.have_rate ? "" : "unset/",
+              g_serve.rate, g_serve.have_pitch ? "" : "unset/", g_serve.pitch,
+              g_serve.have_volume ? "" : "unset/", g_serve.volume,
+              g_serve.have_waitfactor ? "" : "unset/", g_serve.waitfactor);
+    if (n) {
+        rc = ve_setParamList(g_serve.instance, params, (uint16_t)n);
+        if (rc != NUAN_OK) {
+            char buffer[256];
+            frame_error(errText(rc, buffer, sizeof buffer));
+            debug_log(1, "engine parameter setup failed: %s",
+                      errText(rc, buffer, sizeof buffer));
+        }
+    }
+    if (g_debug_level) {
+        n = 0;
+        params_begin(6, query);
+        param_int(&query[n++], PARAM_SPEECHRATE, 0);
+        param_int(&query[n++], PARAM_PITCH, 0);
+        param_int(&query[n++], PARAM_VOLUME, 0);
+        param_int(&query[n++], PARAM_WAITFACTOR, 0);
+        param_int(&query[n++], PARAM_FREQUENCY, 0);
+        param_int(&query[n++], PARAM_TIMBRE, 0);
+        rc = ve_getParamList(g_serve.instance, query, (uint16_t)n);
+        if (rc == NUAN_OK)
+            debug_log(1, "effective params rate=%u pitch=%u volume=%u "
+                      "waitfactor=%u frequency=%u timbre=%u",
+                      query[0].uValue.usValue, query[1].uValue.usValue,
+                      query[2].uValue.usValue, query[3].uValue.usValue,
+                      query[4].uValue.usValue, query[5].uValue.usValue);
+        else {
+            char buffer[256];
+            debug_log(1, "reading effective params failed: %s",
+                      errText(rc, buffer, sizeof buffer));
+        }
+    }
 }
 
 static void serve_list_voices(void)
@@ -301,12 +375,20 @@ static DWORD WINAPI serve_engine_thread(LPVOID param)
         LeaveCriticalSection(&g_serve.lock);
 
         if (list) {
+            debug_log(2, "listing installed voices");
             serve_list_voices();
             continue;
         }
         if (!text)
             continue;
 
+        g_serve.utterance++;
+        g_serve.callbacks = 0;
+        g_serve.markers = 0;
+        g_serve.audio_bytes = 0;
+        g_serve.synth_started = GetTickCount64();
+        debug_log(2, "utterance %u start text-bytes=%llu", g_serve.utterance,
+                  (unsigned long long)strlen(text));
         serve_apply_params();
         if (g_serve.instance_open) {
             VE_INTEXT in_text;
@@ -323,6 +405,11 @@ static DWORD WINAPI serve_engine_thread(LPVOID param)
                 char buffer[256];
                 frame_error(errText(rc, buffer, sizeof buffer));
             }
+            debug_log(2, "utterance %u end rc=0x%08x elapsed-ms=%llu "
+                      "audio-bytes=%llu callbacks=%u markers=%u",
+                      g_serve.utterance, rc,
+                      (unsigned long long)(GetTickCount64() - g_serve.synth_started),
+                      g_serve.audio_bytes, g_serve.callbacks, g_serve.markers);
         }
         free(text);
         frame_write(SERVE_FRAME_DONE, "", 0);
@@ -361,6 +448,12 @@ static int serve_params_set(char *payload)
         }
         line = next;
     }
+    debug_log(2, "parameters voice=%s vop=%s rate=%s%d pitch=%s%d "
+              "volume=%s%d waitfactor=%s%d", g_serve.voice, g_serve.vop,
+              g_serve.have_rate ? "" : "unset/", g_serve.rate,
+              g_serve.have_pitch ? "" : "unset/", g_serve.pitch,
+              g_serve.have_volume ? "" : "unset/", g_serve.volume,
+              g_serve.have_waitfactor ? "" : "unset/", g_serve.waitfactor);
     return 0;
 }
 
@@ -379,6 +472,8 @@ static int cmd_serve(const char *voice, const char *vop)
     }
     snprintf(g_serve.voice, sizeof g_serve.voice, "%s", voice ? voice : "Tian-Tian");
     snprintf(g_serve.vop, sizeof g_serve.vop, "%s", vop ? vop : "embedded-pro");
+    debug_log(1, "resident server starting default-voice=%s default-vop=%s",
+              g_serve.voice, g_serve.vop);
 
     /* The ready frame goes out before the worker starts, so nothing else can
      * interleave with it on standard output. */
@@ -391,6 +486,7 @@ static int cmd_serve(const char *voice, const char *vop)
     }
 
     while (frame_read(&type, &payload, &len) == 0) {
+        debug_log(3, "command type=%c length=%u", type, len);
         if (type == SERVE_CMD_QUIT) {
             free(payload);
             break;
@@ -435,5 +531,6 @@ static int cmd_serve(const char *voice, const char *vop)
     if (g_serve.instance_open)
         ve_close(g_serve.instance);
     DeleteCriticalSection(&g_serve.lock);
+    debug_log(1, "resident server stopped");
     return 0;
 }
