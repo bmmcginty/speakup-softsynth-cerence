@@ -77,9 +77,17 @@ reader. The user running this program needs read/write access to
 bin/speakup-cerence --lang MNC --quality enhanced
 ```
 
-The driver detaches from the terminal and keeps running in the background. Add
-`--foreground` to keep it attached to the current terminal, for example while
-debugging or when a service manager supervises it.
+The launcher detaches from the terminal and keeps the driver running in the
+background. Add `--foreground` to keep it attached to the current terminal,
+for example while debugging or when a service manager supervises it.
+
+The actual driver runs as PID 1 in private user, PID, and mount namespaces.
+Wine and every helper it starts remain in that PID namespace, so the kernel
+forcibly removes them if the driver exits or crashes. The small outer launcher
+forwards `SIGINT`, `SIGTERM`, and `SIGHUP` to the driver; a launcher killed with
+`SIGKILL` uses a parent-death signal to terminate PID 1 and therefore the whole
+namespace. This requires the kernel to permit unprivileged user namespaces; a
+startup error is reported when they are disabled by the host or container.
 
 Because a background process has no terminal to complain on, the driver also
 appends diagnostics to

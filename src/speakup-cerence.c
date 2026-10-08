@@ -5,6 +5,7 @@
 #include <spa/param/audio/format-utils.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -13,6 +14,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/mount.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -46,6 +49,7 @@ static int settings_dirty;
 static unsigned store_fingerprint;
 static unsigned host_store_fingerprint;
 static volatile sig_atomic_t reload_requested;
+static volatile sig_atomic_t child_exited;
 static int speakup_rate = 2;
 static int speakup_volume = 5;
 static int speakup_pitch = 5;
@@ -53,6 +57,7 @@ static int log_fd = -1;
 static FILE *log_file;
 static int log_console;
 static int debug_level;
+static volatile sig_atomic_t namespace_child_pid = -1;
 
 /* --------------------------------------------------------------- logging */
 
@@ -130,6 +135,7 @@ static void log_open(const char *path, int console)
     log_fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0600);
     if (log_fd < 0)
         return;
+    fcntl(log_fd, F_SETFD, FD_CLOEXEC);
     log_file = fdopen(log_fd, "a");
     if (!log_file) {
         close(log_fd);
@@ -332,6 +338,20 @@ static void spawn_host(void)
 /* Ask the bridge to quit and reap it.  The caller must already have stopped the
  * worker, because closing the pipes while it is reading an utterance would
  * lose frames. */
+static void reap_children(void)
+{
+    int status;
+    pid_t pid;
+
+    child_exited = 0;
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+        if (pid == host.pid) {
+            host.pid = -1;
+            stopping = 1;
+        }
+    }
+}
+
 static void stop_host(void)
 {
     if (host.pid <= 0)
@@ -597,6 +617,7 @@ static int open_synth_device(const char *path)
 
 static void on_signal(int sig){(void)sig;stopping=1;}
 static void on_sighup(int sig){(void)sig;reload_requested=1;}
+static void on_sigchld(int sig){(void)sig;child_exited=1;}
 
 /* Detach from the controlling terminal so the driver can outlive the shell
  * that started it.  The parent returns immediately; the grandchild keeps the
@@ -629,6 +650,117 @@ static void daemonize(void)
     }
 }
 
+/* Wine starts helper processes which are not descendants of the bridge for
+ * their entire lifetime.  Run the actual driver as PID 1 in a private PID
+ * namespace: Linux then kills every Wine process in that namespace whenever
+ * the driver exits, including after a crash.  A user namespace supplies the
+ * capability needed to create PID and mount namespaces without privilege. */
+static int write_namespace_file(const char *path, const char *value)
+{
+    int fd = open(path, O_WRONLY);
+    size_t length = strlen(value);
+    size_t done = 0;
+
+    if (fd < 0)
+        return -1;
+    while (done < length) {
+        ssize_t written = write(fd, value + done, length - done);
+        if (written < 0) {
+            if (errno == EINTR)
+                continue;
+            close(fd);
+            return -1;
+        }
+        done += (size_t)written;
+    }
+    return close(fd);
+}
+
+static void forward_namespace_signal(int signal_number)
+{
+    pid_t child = namespace_child_pid;
+
+    if (child > 0)
+        kill(child, signal_number);
+}
+
+static int launch_in_pid_namespace(int argc, char **argv)
+{
+    char uid_map[64], gid_map[64];
+    char **child_argv;
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    pid_t child;
+    struct sigaction action = {0};
+    int parent_pipe[2];
+    int status;
+
+    if (unshare(CLONE_NEWUSER) < 0)
+        die("cannot create user namespace: %s", strerror(errno));
+    snprintf(uid_map, sizeof uid_map, "%u %u 1\n", (unsigned)uid,
+             (unsigned)uid);
+    snprintf(gid_map, sizeof gid_map, "%u %u 1\n", (unsigned)gid,
+             (unsigned)gid);
+    if (write_namespace_file("/proc/self/uid_map", uid_map) < 0 ||
+        (write_namespace_file("/proc/self/setgroups", "deny\n") < 0 &&
+         errno != ENOENT) ||
+        write_namespace_file("/proc/self/gid_map", gid_map) < 0)
+        die("cannot configure user namespace: %s", strerror(errno));
+    if (unshare(CLONE_NEWPID) < 0)
+        die("cannot create PID namespace: %s", strerror(errno));
+
+    child_argv = calloc((size_t)argc + 2, sizeof *child_argv);
+    if (!child_argv)
+        die("out of memory");
+    memcpy(child_argv, argv, (size_t)argc * sizeof *child_argv);
+    child_argv[argc] = "--namespace-child";
+
+    if (pipe2(parent_pipe, O_CLOEXEC) < 0)
+        die("cannot create namespace parent pipe: %s", strerror(errno));
+    child = fork();
+    if (child < 0)
+        die("cannot enter PID namespace: %s", strerror(errno));
+    if (!child) {
+        struct pollfd parent = {parent_pipe[0], POLLIN | POLLHUP, 0};
+        char executable[64];
+
+        close(parent_pipe[1]);
+        if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0)
+            die("cannot set parent-death signal: %s", strerror(errno));
+        if (poll(&parent, 1, 0) > 0 && (parent.revents & POLLHUP))
+            _exit(1);
+        if (unshare(CLONE_NEWNS) < 0 ||
+            mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0 ||
+            mount("proc", "/proc", "proc",
+                  MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0)
+            die("cannot configure PID namespace mounts: %s", strerror(errno));
+        snprintf(executable, sizeof executable, "/proc/%ld/exe",
+                 (long)getpid());
+        execv(executable, child_argv);
+        die("cannot start namespaced driver: %s", strerror(errno));
+    }
+    close(parent_pipe[0]);
+    free(child_argv);
+    namespace_child_pid = child;
+
+    action.sa_handler = forward_namespace_signal;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGINT, &action, NULL);
+    sigaction(SIGTERM, &action, NULL);
+    sigaction(SIGHUP, &action, NULL);
+
+    while (waitpid(child, &status, 0) < 0) {
+        if (errno != EINTR)
+            die("waiting for namespaced driver failed: %s", strerror(errno));
+    }
+    namespace_child_pid = -1;
+    if (WIFEXITED(status))
+        return WEXITSTATUS(status);
+    if (WIFSIGNALED(status))
+        return 128 + WTERMSIG(status);
+    return 1;
+}
+
 static void usage(FILE *f)
 {
     fprintf(f, "usage: speakup-cerence [--lang CODE] [--quality QUALITY] "
@@ -642,6 +774,7 @@ int main(int argc, char **argv)
     const char *debug_path = NULL;
     char default_log[4096];
     int foreground = 0;
+    int namespace_child = 0;
     int i;
     pthread_t thread;
 
@@ -663,6 +796,7 @@ int main(int argc, char **argv)
         }
         else if (!strcmp(argv[i], "--debug-file") && i + 1 < argc) debug_path = argv[++i];
         else if (!strcmp(argv[i], "--foreground")) foreground = 1;
+        else if (!strcmp(argv[i], "--namespace-child")) namespace_child = 1;
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(stdout); return 0; }
         else { usage(stderr); return 2; }
     }
@@ -680,17 +814,22 @@ int main(int argc, char **argv)
                 strerror(errno));
         return 1;
     }
+    if (!namespace_child) {
+        if (!foreground)
+            daemonize();
+        return launch_in_pid_namespace(argc, argv);
+    }
+
     log_msg("speakup-cerence starting (log %s)\n",
             log_path ? log_path : "standard error");
-    debug_msg(1, "debug: level=%d pid=%ld foreground=%d\n",
-              debug_level, (long)getpid(), foreground);
+    debug_msg(1, "debug: level=%d pid=%ld foreground=%d namespace-pid=%ld\n",
+              debug_level, (long)getpid(), foreground, (long)getpid());
     settings_path_init();
     voice_settings_load(&voice_settings, settings_path);
-    if (!foreground)
-        daemonize();
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGHUP, on_sighup);
+    signal(SIGCHLD, on_sigchld);
     signal(SIGPIPE, SIG_IGN);
     spawn_host();
     audio_init(&argc, &argv);
@@ -720,6 +859,8 @@ int main(int argc, char **argv)
         } else if (rc > 0 && (p.revents & (POLLERR | POLLHUP | POLLNVAL))) {
             break;
         }
+        if (child_exited)
+            reap_children();
         if (reload_requested && !stopping) {
             reload_requested = 0;
             restart_host();
