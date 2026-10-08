@@ -968,9 +968,10 @@ int wmain(int argc, wchar_t **wargv)
     char *text_arg = NULL, *cmd_arg = NULL;
     int i, ret = 0;
 
-    /* Wine opens standard output in text mode, which turns every newline into
-     * CRLF.  Machine-readable listings and raw PCM both want the bytes to
-     * survive untouched. */
+    /* Wine opens standard streams in text mode.  That turns output newlines
+     * into CRLF and, more importantly for the resident protocol, treats a
+     * 0x1a byte in an input frame as end-of-file. */
+    _setmode(_fileno(stdin), _O_BINARY);
     _setmode(_fileno(stdout), _O_BINARY);
     _setmode(_fileno(stderr), _O_BINARY);
 

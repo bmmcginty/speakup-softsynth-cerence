@@ -112,8 +112,14 @@ static void frame_error(const char *message)
 static int frame_read(unsigned char *type, char **payload, uint32_t *len)
 {
     unsigned char header[5];
-    if (fread(header, 1, 5, stdin) != 5)
+    size_t got;
+
+    got = fread(header, 1, 5, stdin);
+    if (got != 5) {
+        debug_log(1, "command header read failed: got=%llu eof=%d error=%d",
+                  (unsigned long long)got, feof(stdin), ferror(stdin));
         return -1;
+    }
     *type = header[0];
     *len = (uint32_t)header[1] | ((uint32_t)header[2] << 8) |
            ((uint32_t)header[3] << 16) | ((uint32_t)header[4] << 24);
@@ -122,7 +128,11 @@ static int frame_read(unsigned char *type, char **payload, uint32_t *len)
         char *buffer = malloc((size_t)*len + 1);
         if (!buffer)
             return -1;
-        if (fread(buffer, 1, *len, stdin) != *len) {
+        got = fread(buffer, 1, *len, stdin);
+        if (got != *len) {
+            debug_log(1, "command payload read failed: type=%c length=%u "
+                      "got=%llu eof=%d error=%d", *type, *len,
+                      (unsigned long long)got, feof(stdin), ferror(stdin));
             free(buffer);
             return -1;
         }
